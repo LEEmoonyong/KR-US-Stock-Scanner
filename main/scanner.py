@@ -192,6 +192,14 @@ def _get_df_for_regime(data, ticker: str):
     return None
 
 
+# 섹터 ETF(5일 수익률 Top3용)
+SECTOR_ETFS_5D = [
+    ("XLK", "Technology"), ("XLF", "Financials"), ("XLV", "Healthcare"), ("XLE", "Energy"),
+    ("XLY", "Consumer Cyclical"), ("XLP", "Consumer Defensive"), ("XLI", "Industrial"),
+    ("XLB", "Materials"), ("XLU", "Utilities"),
+]
+
+
 def compute_market_state_from_data(data):
     """
     다지표 종합 시장 레짐 (100점 만점).
@@ -213,6 +221,7 @@ def compute_market_state_from_data(data):
         "spy_vol_ratio": None,
         "sector_qqq_vs_xlp": None,
         "components": {},
+        "sector_5d_return_top3": [],
     }
     df_spy = _get_df_for_regime(data, "SPY")
     if df_spy is None or df_spy.empty:
@@ -332,6 +341,25 @@ def compute_market_state_from_data(data):
         out["regime"] = "CAUTION"
     else:
         out["regime"] = "RISK_ON"
+
+    # 최근 5거래일 수익률 높은 섹터 Top3
+    sector_returns = []
+    for ticker, name in SECTOR_ETFS_5D:
+        df = _get_df_for_regime(data, ticker)
+        if df is None or not hasattr(df, "columns") or "Close" not in df.columns or len(df) < 6:
+            continue
+        close = df["Close"].dropna()
+        if len(close) < 6:
+            continue
+        try:
+            ret_5d = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1.0) * 100.0
+            if np.isfinite(ret_5d):
+                sector_returns.append({"name": name, "ticker": ticker, "return_5d": round(ret_5d, 2)})
+        except Exception:
+            continue
+    sector_returns.sort(key=lambda x: x["return_5d"], reverse=True)
+    out["sector_5d_return_top3"] = sector_returns[:3]
+
     return out
 
 
@@ -1702,7 +1730,8 @@ def backtest_signal_dates(df2: pd.DataFrame, ticker: str):
     - buy_reasons: buy_dates와 동일 순서로, 각 매수 신호 근거(진입 타입/트리거) 문자열.
     - sell_reasons: sell_dates와 동일 순서로, 각 매도 신호 근거(Reason 또는 Action) 문자열.
     """
-    if df2 is None or len(df2) < 260:
+    # SMA200 유효 구간(start_i=200)부터 루프. 최소 201봉 필요. 상장 기간 짧은 종목(SNDK 256봉 등)도 신호 표시
+    if df2 is None or len(df2) < 201:
         return [], [], [], [], []
     buy_dates = []
     sell_dates = []
@@ -3408,7 +3437,7 @@ def main():
         pos_tickers = pos["Ticker"].astype(str).str.upper().tolist()
 
     # ✅ 전체 티커(스캔 + 보유 + 시장지수)
-    bench = ["SPY", "QQQ", "IWM", "^VIX", "XLP"]
+    bench = ["SPY", "QQQ", "IWM", "^VIX", "XLP", "XLK", "XLF", "XLV", "XLE", "XLY", "XLI", "XLB", "XLU"]
     scan_universe = [t.upper() for t in TICKERS if t.upper() not in TICKER_BLACKLIST]
     all_tickers = sorted(list(set(scan_universe + pos_tickers + bench)))
 

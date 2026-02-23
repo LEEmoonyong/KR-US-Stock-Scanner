@@ -459,6 +459,13 @@ def hard_refresh():
     # 미국 최근 종가 기준 전 데이터 최신화 (세션 전체 clear 없이 캐시/스냅/트래커만 정리)
     st.session_state["data_refresh_ts"] = datetime.now().isoformat()
     st.cache_data.clear()
+    # ohlcv.db(로컬 SQLite)도 삭제 → 다음 fetch 시 yfinance에서 새로 받음
+    ohlcv_db = os.path.join(BASE_DIR, "cache", "ohlcv.db")
+    if os.path.exists(ohlcv_db):
+        try:
+            os.remove(ohlcv_db)
+        except OSError:
+            pass
     st.session_state.pop("scan_snap", None)
     st.session_state.pop("tp3_tracker", None)
     st.rerun()
@@ -495,6 +502,87 @@ def _drop_today_bar_if_needed(df: pd.DataFrame) -> pd.DataFrame:
 
 # ---------- helpers ----------
 
+def _fetch_price_inner(
+    ticker: str,
+    lookback_days: int,
+    cache_buster: str,
+    min_rows: int = 0,
+    retries: int = 0,
+    debug_out: Optional[List[str]] = None,
+) -> Optional[pd.DataFrame]:
+    """실제 fetch 로직. debug_out 있으면 로그 추가."""
+
+    def _log(msg: str) -> None:
+        if debug_out is not None:
+            debug_out.append(msg)
+
+    def _download(days: int, need_rows: int = 0) -> Optional[pd.DataFrame]:
+        end = datetime.now(ZoneInfo("America/New_York")).date()
+        start = end - timedelta(days=int(days))
+
+        df = None
+        if ohlcv_fetcher is not None:
+            df = ohlcv_fetcher.fetch_ohlcv_with_fallback(
+                ticker, start, end, min_rows=need_rows, base_dir=BASE_DIR
+            )
+            _log(f"ohlcv_fetcher: df={'None' if df is None else f'len={len(df)}'}")
+        if df is None or df.empty:
+            import yfinance as yf
+            df = yf.download(
+                tickers=ticker,
+                start=str(start),
+                end=str(end + timedelta(days=1)),
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                threads=False,
+                group_by="ticker",
+            )
+            raw_len = 0 if df is None else len(df)
+            raw_cols = list(df.columns) if df is not None and not df.empty else []
+            _log(f"yf.download: len={raw_len}, columns={raw_cols}, MultiIndex={isinstance(df.columns, pd.MultiIndex) if df is not None else 'N/A'}")
+            if df is not None and not df.empty and len(df) > 0:
+                _log(f"tail sample:\n{df.tail(2).to_string()}")
+            if df is None or len(df) == 0:
+                return None
+            if isinstance(df.columns, pd.MultiIndex):
+                if ticker in df.columns.get_level_values(0):
+                    df = df[ticker]
+                else:
+                    df.columns = df.columns.get_level_values(-1)
+        need_cols = ["Open", "High", "Low", "Close", "Volume"]
+        for c in need_cols:
+            if c not in df.columns:
+                _log(f"missing col '{c}', have={list(df.columns)}")
+                return None
+        before_dropna = len(df)
+        df = df.dropna(subset=need_cols).copy()
+        after_dropna = len(df)
+        df = _drop_today_bar_if_needed(df)
+        after_drop_today = len(df)
+        _log(f"after processing: before_dropna={before_dropna}, after_dropna={after_dropna}, after_drop_today={after_drop_today}")
+        return df
+
+    df = _download(lookback_days, int(min_rows))
+
+    attempt = 0
+    cur_days = int(lookback_days)
+    while attempt < int(retries):
+        if df is not None and not df.empty and (min_rows <= 0 or len(df) >= int(min_rows)):
+            break
+        cur_days = int(cur_days * 1.6) + 30
+        df = _download(cur_days, int(min_rows))
+        attempt += 1
+
+    if df is None or df.empty:
+        _log("최종: df=None 또는 empty → None 반환")
+        return None
+    if min_rows > 0 and len(df) < int(min_rows):
+        _log(f"최종: len={len(df)} < min_rows={min_rows} → None 반환")
+        return None
+    return df
+
+
 @st.cache_data(show_spinner=False, ttl=60*60)
 def fetch_price(
     ticker: str,
@@ -508,61 +596,7 @@ def fetch_price(
     - 캐시 hit 시 API 호출 없음. 2차는 ALPHA_VANTAGE_API_KEY 환경변수 필요.
     - min_rows/retries: 데이터 부족 시 lookback 늘려 재시도.
     """
-
-    def _download(days: int, need_rows: int = 0) -> Optional[pd.DataFrame]:
-        end = datetime.now(ZoneInfo("America/New_York")).date()
-        start = end - timedelta(days=int(days))
-
-        df = None
-        if ohlcv_fetcher is not None:
-            df = ohlcv_fetcher.fetch_ohlcv_with_fallback(
-                ticker, start, end, min_rows=need_rows, base_dir=BASE_DIR
-            )
-        if df is None or df.empty:
-            import yfinance as yf
-            df = yf.download(
-                tickers=ticker,
-                start=str(start),
-                end=str(end + timedelta(days=1)),
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                threads=False,
-                group_by="ticker",
-            )
-            if df is None or len(df) == 0:
-                return None
-            if isinstance(df.columns, pd.MultiIndex):
-                if ticker in df.columns.get_level_values(0):
-                    df = df[ticker]
-                else:
-                    df.columns = df.columns.get_level_values(-1)
-        need_cols = ["Open", "High", "Low", "Close", "Volume"]
-        for c in need_cols:
-            if c not in df.columns:
-                return None
-        df = df.dropna(subset=need_cols).copy()
-        df = _drop_today_bar_if_needed(df)
-        return df
-
-    # 1차 시도 (min_rows 전달: 캐시만으로 부족하면 yf/AV 재시도하도록)
-    df = _download(lookback_days, int(min_rows))
-
-    # 재시도 (데이터 부족/비어있음 대응)
-    attempt = 0
-    cur_days = int(lookback_days)
-    while attempt < int(retries):
-        if df is not None and not df.empty and (min_rows <= 0 or len(df) >= int(min_rows)):
-            break
-        cur_days = int(cur_days * 1.6) + 30
-        df = _download(cur_days, int(min_rows))
-        attempt += 1
-
-    if df is None or df.empty:
-        return None
-    if min_rows > 0 and len(df) < int(min_rows):
-        return None
-    return df
+    return _fetch_price_inner(ticker, lookback_days, cache_buster, min_rows, retries, None)
 
 
 
@@ -1829,8 +1863,11 @@ def render_ticker_card(row: pd.Series, rank: int, run_date: str):
         if note: st.write(f"Note: {note}")
 
 
-def build_df2(df: pd.DataFrame):
-    # scanner.py에서 쓰는 지표 세팅과 동일
+def build_df2(df: pd.DataFrame, keep_all_rows: bool = False):
+    """
+    scanner.py에서 쓰는 지표 세팅과 동일.
+    keep_all_rows=True: 상장 기간 짧은 종목(340봉 미만)용. dropna 생략 → 상장일~최근 거래일 전부 표시.
+    """
     close = df["Close"]
     df["SMA20"] = sc.sma(close, 20)
     df["SMA50"] = sc.sma(close, 50)
@@ -1838,7 +1875,7 @@ def build_df2(df: pd.DataFrame):
     df["ATR14"] = sc.atr(df, 14)
     df["MACD_H"] = sc.macd_hist(close)
     df["RSI14"] = sc.rsi(close, 14)
-    df2 = df.dropna().copy()
+    df2 = df.copy() if keep_all_rows else df.dropna().copy()
     return df2
 
 def update_top3_buy_tracker(top3: pd.DataFrame, run_date: str, cache_buster: str):
@@ -1932,27 +1969,25 @@ def analyze_ticker_reco(ticker: str, shares: float = 1.0, avg_price: Optional[fl
     """
     ticker = str(ticker).upper().strip()
 
-    # 1) lookback 넉넉히(900일) 해서 1회 fetch로 260봉 확보 목표 (재시도 최소화)
+    # 1) lookback 넉넉히(900일) 해서 fetch. 상장 기간 짧은 종목은 오늘 봉 제외한 최대 봉만큼 표시
     lookback = int(max(getattr(cfg, "LOOKBACK_DAYS", 240), 900))
 
-    # 2) 1차 fetch
-    df = fetch_price(ticker, lookback, get_cache_buster(), min_rows=260, retries=2)
+    # 2) 1차 fetch (min_rows=0 → 가용한 만큼만 받아도 OK, SNDK 등 256봉만 있어도 표시)
+    df = _fetch_price_inner(ticker, lookback, get_cache_buster(), min_rows=0, retries=2, debug_out=None)
 
-    # 3) 2차 보강(1차에서 부족할 때만)
-    if df is None or df.empty or len(df) < 260:
-        df = fetch_price(ticker, 1400, get_cache_buster(), min_rows=260, retries=1)
+    # 3) 2차 보강(1차에서 비었을 때만)
+    if df is None or df.empty:
+        df = _fetch_price_inner(ticker, 1400, get_cache_buster(), min_rows=0, retries=1, debug_out=None)
 
     # 4) 최종 방어
     if df is None or df.empty:
-        return {"error": "OHLCV 데이터가 없습니다. 티커를 확인하세요."}
+        return {"error": "OHLCV 데이터가 없습니다. 티커를 확인하세요.", "ticker": ticker}
 
-    if len(df) < 260:
-        return {"error": f"데이터 길이 부족(최소 260봉 필요: SMA200 포함) 현재={len(df)}"}
-
-    # 5) 지표 계산
-    df2 = build_df2(df)
-    if df2 is None or df2.empty or len(df2) < 140:
-        return {"error": f"지표 계산 후 유효 데이터 부족(SMA200/ATR 계산 후 남은 봉이 적음) 현재={0 if df2 is None else len(df2)}"}
+    # 5) 지표 계산. 340봉 미만이면 keep_all_rows → 상장일~최근 거래일 전부 표시(SNDK 256봉 등)
+    keep_all = len(df) < 340
+    df2 = build_df2(df, keep_all_rows=keep_all)
+    if df2 is None or df2.empty or len(df2) < 1:
+        return {"error": f"지표 계산 후 유효 데이터 없음 현재={0 if df2 is None else len(df2)}", "ticker": ticker}
 
     last_close = float(df2.iloc[-1]["Close"])
     use_avg = float(avg_price) if (avg_price is not None and avg_price > 0) else last_close
@@ -2003,8 +2038,8 @@ def analyze_ticker_reco(ticker: str, shares: float = 1.0, avg_price: Optional[fl
     # ✅ 목표가(ATR) 계산: use_avg 기준(티커 검색=현재가, 포트폴리오=매수가). ADD_BUY면 목표가 상향(boost=True)
     t1, t2, t3, cur_close = compute_tp_levels_from_df2(df2, boost=(reco == "ADD_BUY"), base_price=use_avg)
 
-    # ✅ 1년 일봉 + 백테스트 매수/매도 신호 날짜 (차트용)
-    df_1y = df2.tail(252).copy()
+    # ✅ 1년 일봉 또는 상장 이후 전체 (340봉 미만이면 가용한 전부, SNDK 256봉 등)
+    df_1y = df2.copy() if len(df2) <= 300 else df2.tail(252).copy()
     buy_signal_dates = []
     sell_signal_dates = []
     sell_entry_prices = []
@@ -2027,7 +2062,7 @@ def analyze_ticker_reco(ticker: str, shares: float = 1.0, avg_price: Optional[fl
         "tp": {"t1": t1, "t2": t2, "t3": t3, "close": cur_close},
         "use_avg": use_avg,
         "price_basis": "avg_price" if (avg_price is not None and float(avg_price) > 0) else "current",
-        "df_tail": df2.tail(30).copy(),
+        "df_tail": df2.copy() if len(df2) <= 140 else df2.tail(30).copy(),
         "df_1y": df_1y,
         "buy_signal_dates": buy_signal_dates,
         "sell_signal_dates": sell_signal_dates,
@@ -2271,7 +2306,7 @@ if os.path.isfile(_logo_path):
         # 고정 높이 영역 안에서 로고만 아래쪽에 배치 (탭 등 다른 요소는 그대로)
         st.markdown(
             '<div style="height:100px;position:relative;">'
-            '<img src="data:image/png;base64,' + logo_b64 + '" style="width:' + str(_logo_width) + 'px;position:absolute;bottom:-96px;left:-48px;display:block;" alt="US Swing Scanner" />'
+            '<img src="data:image/png;base64,' + logo_b64 + '" style="width:' + str(_logo_width) + 'px;position:absolute;bottom:-96px;left:-80px;display:block;" alt="US Swing Scanner" />'
             '</div>',
             unsafe_allow_html=True,
         )
@@ -2299,9 +2334,8 @@ with tab1:
             res = analyze_ticker_reco(ticker, shares=1.0, avg_price=None)
             if "error" in res:
                 st.error(res["error"])
-            else:
-                st.session_state["ticker_result"] = res
-                st.session_state["show_ticker_result"] = True
+            st.session_state["ticker_result"] = res
+            st.session_state["show_ticker_result"] = True
     with btn_col2:
         if st.session_state.get("show_ticker_result") and st.session_state.get("ticker_result"):
             if st.button("닫기", key="close_ticker_result", type="secondary"):
@@ -2312,6 +2346,9 @@ with tab1:
     # 저장된 결과가 있으면 차트/데이터 블록 표시
     if st.session_state.get("show_ticker_result") and st.session_state.get("ticker_result"):
         res = st.session_state["ticker_result"]
+
+        if "error" in res:
+            st.stop()
 
         st.success(f"[{res['ticker']}] 추천: {res['reco']}")
         st.write(res["why"])
@@ -2342,9 +2379,6 @@ with tab1:
             pct_display = (suggested_pct * 100) if suggested_pct is not None and suggested_pct <= 1.0 else suggested_pct
             st.markdown(f"- **권장 매도 비율(스케일아웃)**: {pct_display:.0f}% — {suggested_reason} (보유 수량 중 이 비율만큼 매도 권장)")
 
-        if res.get("plan"):
-            st.markdown("**Plan**")
-            st.write(res["plan"])
         # 최근 매수/매도 신호 날짜·근거 (차트 위 한 줄씩)
         buy_dates = res.get("buy_signal_dates") or []
         sell_dates = res.get("sell_signal_dates") or []
@@ -3020,6 +3054,56 @@ with tab3:
                     st.markdown(_p(f"{label}: {v} {cb}"), unsafe_allow_html=True)
                 else:
                     st.markdown(_p(f"{label}: {v} ➖ normal"), unsafe_allow_html=True)
+            top3_sector = ms.get("sector_5d_return_top3") or []
+            if top3_sector:
+                st.markdown(_p("**최근 5거래일 수익률 높은 섹터 Top3**"), unsafe_allow_html=True)
+                for i, s in enumerate(top3_sector, 1):
+                    name = s.get("name", s.get("ticker", "—"))
+                    ticker = s.get("ticker", "")
+                    ret = s.get("return_5d")
+                    r = f"{ret:+.2f}%" if ret is not None and np.isfinite(ret) else "—"
+                    st.markdown(_p(f"  {i}. {name} ({ticker}) {r}"), unsafe_allow_html=True)
+
+    with st.expander("스캐너 도움말 (컬럼 설명)"):
+        _h = lambda s: f"<p style='color:#e2e8f0;font-size:0.95rem;margin:0.15rem 0;'>{s}</p>"
+        st.markdown(_h("**스캔 결과 테이블에 나오는 컬럼들의 간단한 의미입니다.**"), unsafe_allow_html=True)
+        help_items = [
+            ("**Ticker**", "종목 코드 (예: AAPL, NVDA). 미국 주식 심볼입니다."),
+            ("**Sector**", "해당 종목이 속한 업종/섹터 (예: Technology, Healthcare)."),
+            ("**Entry**", "진입 신호 종류. BUY_BREAKOUT(돌파 매수), BUY_PULLBACK(눌림 매수), WATCH(관망) 등으로 표시됩니다."),
+            ("**EntryRaw**", "진입 신호의 원본 값. Entry와 동일하거나 세부 구분용입니다."),
+            ("**Close**", "최근 거래일 종가. 현재 기준 가격입니다."),
+            ("**MktCap_KRW_T**", "시가총액(원화, 조 단위). 회사 규모를 보는 지표입니다."),
+            ("**EV**", "기업가치(Enterprise Value). 시가총액 + 부채 − 현금으로, 인수 시 필요한 규모를 나타냅니다."),
+            ("**Prob**", "전략/모델에서 산출한 확률 관련 수치입니다."),
+            ("**RR**", "리워드/리스크 비율(Risk-Reward). 기대 수익 대비 손실 비율로, 1.5 이상이면 유리한 편입니다."),
+            ("**Score**", "종합 점수. 여러 조건을 반영한 순위/점수입니다."),
+            ("**VolRatio**", "거래량 비율. 최근 거래량이 평균(예: 20일) 대비 몇 배인지 보여줍니다. 돌파 시 거래량이 많을수록 유리합니다."),
+            ("**RSI**", "RSI(14). 과매수(70 근처 이상)/과매도(30 근처 이하)를 보는 지표입니다. 30~70 사이가 보통입니다."),
+            ("**ATR%**", "ATR을 가격으로 나눈 비율(%). 변동성 크기를 보여줍니다. 클수록 움직임이 큽니다."),
+            ("**ADX**", "추세 강도 지표. 숫자가 클수록 추세가 뚜렷하다는 뜻입니다 (보통 20 이상이면 추세 있다고 봅니다)."),
+            ("**RS_vs_SPY**", "SPY(미국 대표 지수) 대비 상대 강도. 이 값이 높으면 시장보다 잘 오른 종목입니다."),
+            ("**PctOff52H**", "52주 고점 대비 현재가가 몇 % 아래인지. 0에 가까우면 고점 근처, 작을수록 고점에서 멀리 떨어져 있습니다."),
+            ("**Trigger**", "진입 신호가 나온 이유(트리거). 예: '20일 고점 돌파', 'SMA50 근처 반등' 등."),
+            ("**EntryHint**", "진입 시 참고할 가격/조건. 예: '이 가격 위에서 분할 매수' 같은 안내입니다."),
+            ("**Invalidation**", "신호가 무효가 되는 조건. 예: 'SMA50 이탈 또는 손절가 도달' — 이 조건이 되면 매수 관점을 재검토합니다."),
+            ("**Reasons**", "해당 진입/관망 판단의 근거를 요약한 텍스트입니다."),
+            ("**MACDTrigger**", "MACD 지표로 인한 트리거(신호)가 있는지 여부입니다."),
+            ("**Note**", "추가 메모. 이평 정렬, 시장 상태 등 보조 설명이 들어갑니다."),
+            ("**EntryPrice**", "권장 진입가. 보통 신호일 종가 또는 그 근처입니다."),
+            ("**StopPrice**", "손절가. 이 가격 아래로 떨어지면 손절을 고려하는 구간입니다."),
+            ("**TargetPrice**", "목표가. 익절을 노리는 가격대입니다."),
+            ("**Shares**", "계산된 추천 매수 수량(주). 포지션 사이징 결과입니다."),
+            ("**PosValue**", "포지션 규모(금액). EntryPrice × Shares로, 투입 예상 금액입니다."),
+            ("**Avg$Vol**", "평균 거래대금. 일 평균 거래 규모로, 유동성 참고용입니다."),
+            ("**P**", "진입 신호 타입 우선순위이고, 숫자가 작을수록 더 우선입니다."),
+            ("**Pwin**", "승률(Win rate). 과거/시뮬 기준 이 strategy에서 이길 비율을 나타낼 수 있습니다."),
+            ("**RR_s**", "RR(Risk-Reward) 관련 보조 수치입니다."),
+            ("**T**", "진입 타입 순위 (0=돌파, 1=눌림, 2=스마트, 9=기타)."),
+            ("**Promoted**", "BUY 신호 종목이 부족할 때 WATCH 중에서 선별해 승격시킨 종목입니다."),
+        ]
+        for label, desc in help_items:
+            st.markdown(_h(f"{label}: {desc}"), unsafe_allow_html=True)
 
     # 항상 DataFrame으로 강제
     def _df(x):
