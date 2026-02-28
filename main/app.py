@@ -607,7 +607,7 @@ def fetch_price(
 # Charts (SPY/QQQ/USDKRW) + TopPick BUY Performance Tracker
 # =========================
 
-TRACKER_CSV = "top_pick_buy_tracker.csv"
+TRACKER_CSV = os.path.join(BASE_DIR, "top_pick_buy_tracker.csv")
 
 def _load_snapshot(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
@@ -1004,6 +1004,21 @@ def load_tracker(path=TRACKER_CSV):
 
 def save_tracker(df: pd.DataFrame, path=TRACKER_CSV):
     df = df.copy()
+    # SignalDate/EntryDate가 저장 시 빠지지 않도록 날짜 컬럼을 YYYY-MM-DD 문자열로 통일
+    for col in ["SignalDate", "EntryDate", "LastBarDate", "ExitDate"]:
+        if col not in df.columns:
+            continue
+        def _date_str(v):
+            if v is None or (isinstance(v, float) and np.isnan(v)) or (pd.isna(v)):
+                return ""
+            try:
+                d = pd.Timestamp(v)
+                if pd.isna(d):
+                    return ""
+                return d.strftime("%Y-%m-%d")
+            except Exception:
+                return ""
+        df[col] = df[col].apply(_date_str)
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 def _parse_run_date(run_date_like) -> Optional[datetime.date]:
@@ -1148,10 +1163,10 @@ def seed_tracker_from_recent_snapshots(
             signal_date = signal_date_px
             entry_date_px = signal_date_px  # EntryDate = SignalDate
 
-        # StopPrice는 가능하면 계산
+        # StopPrice는 가능하면 계산. lookback 900일로 캐시에 1년치 저장
         stop_price = np.nan
         try:
-            df_for_stop = fetch_price(t, lookback_days=240, cache_buster=get_cache_buster())
+            df_for_stop = fetch_price(t, lookback_days=900, cache_buster=get_cache_buster())
             if df_for_stop is not None and not df_for_stop.empty and len(df_for_stop) >= 140:
                 df2_for_stop = build_df2(df_for_stop)
                 if df2_for_stop is not None and not df2_for_stop.empty and len(df2_for_stop) >= 140:
@@ -1187,7 +1202,7 @@ def _entry_price_on_signal_date(ticker: str):
     """
     EntryDate = SignalDate, EntryPrice = SignalDate의 종가 (신호날 종가)
     """
-    df = fetch_price(ticker, lookback_days=240, cache_buster=get_cache_buster())
+    df = fetch_price(ticker, lookback_days=900, cache_buster=get_cache_buster())
     if df is None or df.empty or len(df) < 2:
         return None, None
 
@@ -1197,11 +1212,18 @@ def _entry_price_on_signal_date(ticker: str):
 
 
 
+def _fetch_recent_close(ticker: str, min_rows: int = 2) -> Optional[pd.DataFrame]:
+    """
+    최근 종가용 단일 fetch. Streamlit 캐시 우회 → 티커검색/트래커/포트폴리오 간 종가 일치.
+    """
+    return _fetch_price_inner(ticker, 30, get_cache_buster(), min_rows=min_rows)
+
+
 def _current_close(ticker: str):
-    df = fetch_price(ticker, lookback_days=120, cache_buster=get_cache_buster())  # ✅ 60 -> 120(여유)
+    """단일 소스: 모든 섹션에서 동일한 종가 사용."""
+    df = _fetch_recent_close(ticker)
     if df is None or df.empty or len(df) < 2:
         return None, None
-
     return float(df["Close"].iloc[-1]), _ensure_dt(df.index[-1])
 
 
@@ -1211,7 +1233,7 @@ def _exit_signal_from_scanner(ticker: str, shares: float = 1.0, avg_price: float
       - holding_risk_review가 SELL_TRAIL / SELL_TREND / TAKE_PROFIT 이면 exit
       - days_held/max_hold_days 넘기면 2번(만료 근접 시 트레일 강화·컨펌 완화) 적용
     """
-    df = fetch_price(ticker, lookback_days=240, cache_buster=get_cache_buster())
+    df = fetch_price(ticker, lookback_days=900, cache_buster=get_cache_buster())
     if df is None or df.empty or len(df) < 140:
         return None, None
 
@@ -1278,6 +1300,7 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
     - PROMOTED 종목(SEE/SO 같은) 자동 제거 (OPEN에서만 제거)
     - 기존에 추적 중이던 정상 BUY 종목(과거 OPEN)은 절대 '유니버스 밖' 이유로 삭제하지 않음  ← 핵심
     - 신규 편입 종목은 당일/첫날엔 exit 판정 금지(바로 CLOSED 방지)
+    - CLOSED는 15거래일 도달 시에만 적용(조기 청산/손절/익절 시그널 무시)
     """
     tr = load_tracker()
 
@@ -1361,10 +1384,15 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
             continue
 
         if run_date is not None:
-            entry_price, entry_date = _close_on_date(t, run_date)
-            signal_date = pd.Timestamp(run_date) if entry_date else None
-            if entry_price is None or entry_date is None:
+            entry_price, _ = _close_on_date(t, run_date)
+            # run_date 해당일 봉이 없으면(장 마감 전/데이터 지연) 최신 가용 종가로 폴백 → 트래커 누락 방지
+            if entry_price is None:
+                entry_price, _ = _entry_price_on_signal_date(t)
+            if entry_price is None:
                 continue
+            # Signal/Entry 날짜는 항상 스캐너를 돌린 날(run_date)로 고정
+            signal_date = pd.Timestamp(run_date)
+            entry_date = pd.Timestamp(run_date)
         else:
             entry_price, signal_date = _entry_price_on_signal_date(t)
             if entry_price is None or signal_date is None:
@@ -1379,10 +1407,10 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
         if dup_mask is not None and dup_mask.any():
             continue
 
-        # StopPrice 계산(가능하면)
+        # StopPrice 계산(가능하면). lookback 900일로 캐시에 1년치 저장 → 티커 검색 시 1년 차트 표시
         stop_price = np.nan
         try:
-            df_for_stop = fetch_price(t, lookback_days=240, cache_buster=get_cache_buster())
+            df_for_stop = fetch_price(t, lookback_days=900, cache_buster=get_cache_buster())
             if df_for_stop is not None and (not df_for_stop.empty) and len(df_for_stop) >= 140:
                 df2_for_stop = build_df2(df_for_stop)
                 if df2_for_stop is not None and (not df2_for_stop.empty) and len(df2_for_stop) >= 140:
@@ -1420,19 +1448,19 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
     tr["Ticker"] = tr["Ticker"].astype(str).str.upper().str.strip()
     tr["Status"] = tr["Status"].astype(str)
 
-    # OPEN인데 SignalDate/EntryDate 비어 있으면 가격 데이터로 보정
+    # OPEN 행 중 SignalDate/EntryDate가 비어 있을 때만 채움. 이미 있으면 절대 덮어쓰지 않음(23일로 바뀌는 현상 방지)
     for idx, row in tr[tr["Status"] == "OPEN"].iterrows():
+        sd = row.get("SignalDate")
+        ed = row.get("EntryDate")
+        if pd.notna(sd) and pd.notna(ed) and str(sd) != "" and str(ed) != "":
+            continue
         t = str(row.get("Ticker", "")).upper().strip()
         if not t:
             continue
-        sd = _ensure_dt(row.get("SignalDate"))
-        ed = _ensure_dt(row.get("EntryDate"))
-        if sd is not None and ed is not None:
-            continue
-        _, signal_date = _entry_price_on_signal_date(t)
-        if signal_date is not None:
-            tr.loc[idx, "SignalDate"] = pd.Timestamp(signal_date) if isinstance(signal_date, date) else signal_date
-            tr.loc[idx, "EntryDate"] = tr.loc[idx, "SignalDate"]
+        _, fill_date = _entry_price_on_signal_date(t)
+        if fill_date is not None:
+            tr.at[idx, "SignalDate"] = pd.Timestamp(fill_date) if not isinstance(fill_date, date) else fill_date
+            tr.at[idx, "EntryDate"] = tr.at[idx, "SignalDate"]
 
     open_df = tr[tr["Status"] == "OPEN"].copy()
     closed_today = []
@@ -1481,27 +1509,10 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
             # 최소 2일차부터만 exit 로직 적용
             continue
 
+        # ✅ TOP PICK3 성과 추적: 15거래일 도달 시에만 CLOSED (조기 청산 없음)
         exit_reason = None
-
-        # (1) 15거래일 도달
         if days_held >= max_hold_days:
             exit_reason = "TIME_EXIT(15D)"
-
-        # (2) 손절: 저장된 StopPrice 우선
-        if exit_reason is None:
-            saved_stop = row.get("StopPrice", np.nan)
-            try:
-                if saved_stop is not None and np.isfinite(float(saved_stop)):
-                    if cur_close < float(saved_stop):
-                        exit_reason = f"STOP_LOSS(<{float(saved_stop):.2f})"
-            except Exception:
-                pass
-
-        # (3) 매도/익절 시그널(holding_risk_review 기반). TOP PICK3만 2번(만료근접) 적용
-        if exit_reason is None:
-            action, _ = _exit_signal_from_scanner(t, shares=1.0, avg_price=entry_price, days_held=days_held, max_hold_days=max_hold_days)
-            if action in ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK", "SELL_LOSS_CUT", "TAKE_PROFIT"):
-                exit_reason = action
 
         if exit_reason is not None:
             tr.loc[idx, "Status"] = "CLOSED"
@@ -1519,9 +1530,8 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
 
 def compute_cum_returns(tr: pd.DataFrame, today: datetime.date):
     """
-    ✅ CLOSED 확정 수익률을 ReturnPct 컬럼을 그대로 믿지 말고,
-       EntryPrice / ExitPrice로 재계산해서 사용.
-    ✅ 말도 안되는 레코드(예: EntryPrice<=0, ExitPrice<=0, 1회 트레이드 +400% 등)는 제외.
+    ✅ CLOSED 확정 수익률을 EntryPrice/ExitPrice로 재계산.
+    ✅ 월간/연간/총 수익률: CLOSED 종목들의 누적(복리) 수익률로 표시.
     """
     if tr is None or tr.empty:
         return {"daily": 0.0, "monthly": 0.0, "yearly": 0.0, "total": 0.0}
@@ -1533,7 +1543,6 @@ def compute_cum_returns(tr: pd.DataFrame, today: datetime.date):
     if c.empty:
         return {"daily": 0.0, "monthly": 0.0, "yearly": 0.0, "total": 0.0}
 
-    # 필수 컬럼
     need = ["ExitDate", "EntryPrice", "ExitPrice"]
     for col in need:
         if col not in c.columns:
@@ -1546,11 +1555,7 @@ def compute_cum_returns(tr: pd.DataFrame, today: datetime.date):
     c = c.dropna(subset=["ExitDate", "EntryPrice", "ExitPrice"]).copy()
     c = c[(c["EntryPrice"] > 0) & (c["ExitPrice"] > 0)].copy()
 
-    # ✅ ReturnPct 재계산
     c["ReturnPctCalc"] = (c["ExitPrice"] / c["EntryPrice"] - 1.0) * 100.0
-
-    # ✅ 이상치 제거: 한 번 트레이드가 +445% 이런 건 CSV 오염/가격스케일 꼬임 가능성 매우 큼
-    # (너 스캐너가 원래 스윙용이면 1회 트레이드 +200%도 거의 비정상이라 봐도 됨)
     c = c[(c["ReturnPctCalc"] >= -80.0) & (c["ReturnPctCalc"] <= 200.0)].copy()
 
     def _compound(df: pd.DataFrame) -> float:
@@ -1577,14 +1582,13 @@ def compute_cum_returns(tr: pd.DataFrame, today: datetime.date):
 
 def compute_open_avg_return(tr: pd.DataFrame) -> float:
     """
-    ✅ OPEN(표에 있는) 종목들의 '현재 Return%' 평균
-    - EntryPrice(PrevClose) 대비 현재 종가 기준
+    ✅ OPEN(표에 있는) 종목들의 '현재 Return%' 평균 (TOP PICK 수익률용)
+    - EntryPrice 대비 현재 종가 기준
     - 데이터 못 가져오는 종목은 제외
     """
     if tr is None or not isinstance(tr, pd.DataFrame) or tr.empty:
         return 0.0
 
-    # 컬럼 방어
     if "Status" not in tr.columns or "Ticker" not in tr.columns or "EntryPrice" not in tr.columns:
         return 0.0
 
@@ -1596,24 +1600,59 @@ def compute_open_avg_return(tr: pd.DataFrame) -> float:
     for _, r in open_df.iterrows():
         t = str(r.get("Ticker", "")).upper().strip()
         entry = r.get("EntryPrice", None)
-
         try:
             if not t or entry is None or not np.isfinite(float(entry)) or float(entry) <= 0:
                 continue
         except Exception:
             continue
-
         cur_close, _ = _current_close(t)
         if cur_close is None:
             continue
-
         ret = (float(cur_close) / float(entry) - 1) * 100.0
         rets.append(ret)
 
     if not rets:
         return 0.0
-
     return float(np.mean(rets))
+
+
+def compute_open_daily_change_avg(tr: pd.DataFrame) -> float:
+    """
+    ✅ OPEN 종목들의 '오늘 하루 거래일 동안 변동된 수익률' 평균 (일간 수익률용)
+    - 전일 종가 대비 현재가 변동분을 진입가 대비 %로 환산 후 평균
+    - _fetch_recent_close 단일 소스로 종가 일치
+    """
+    if tr is None or not isinstance(tr, pd.DataFrame) or tr.empty:
+        return 0.0
+    if "Status" not in tr.columns or "Ticker" not in tr.columns or "EntryPrice" not in tr.columns:
+        return 0.0
+
+    open_df = tr[tr["Status"] == "OPEN"].copy()
+    if open_df.empty:
+        return 0.0
+
+    changes = []
+    for _, r in open_df.iterrows():
+        t = str(r.get("Ticker", "")).upper().strip()
+        entry = r.get("EntryPrice", None)
+        try:
+            if not t or entry is None or not np.isfinite(float(entry)) or float(entry) <= 0:
+                continue
+        except Exception:
+            continue
+        df = _fetch_recent_close(t)
+        if df is None or df.empty or len(df) < 2:
+            continue
+        entry_f = float(entry)
+        prev_close = float(df["Close"].iloc[-2])
+        cur_close = float(df["Close"].iloc[-1])
+        # 오늘 하루 동안 변동된 수익률 = (현재가 - 전일종가) / 진입가 * 100
+        daily_change_pct = (cur_close - prev_close) / entry_f * 100.0
+        changes.append(daily_change_pct)
+
+    if not changes:
+        return 0.0
+    return float(np.mean(changes))
 
 
 def _bar10(pct_0_100: float):
@@ -1871,8 +1910,10 @@ def build_df2(df: pd.DataFrame, keep_all_rows: bool = False):
     close = df["Close"]
     df["SMA20"] = sc.sma(close, 20)
     df["SMA50"] = sc.sma(close, 50)
+    df["SMA150"] = sc.sma(close, 150)
     df["SMA200"] = sc.sma(close, 200)
     df["ATR14"] = sc.atr(df, 14)
+    df["ADX14"] = sc.adx(df, 14)
     df["MACD_H"] = sc.macd_hist(close)
     df["RSI14"] = sc.rsi(close, 14)
     df2 = df.copy() if keep_all_rows else df.dropna().copy()
@@ -1972,10 +2013,10 @@ def analyze_ticker_reco(ticker: str, shares: float = 1.0, avg_price: Optional[fl
     # 1) lookback 넉넉히(900일) 해서 fetch. 상장 기간 짧은 종목은 오늘 봉 제외한 최대 봉만큼 표시
     lookback = int(max(getattr(cfg, "LOOKBACK_DAYS", 240), 900))
 
-    # 2) 1차 fetch (min_rows=0 → 가용한 만큼만 받아도 OK, SNDK 등 256봉만 있어도 표시)
-    df = _fetch_price_inner(ticker, lookback, get_cache_buster(), min_rows=0, retries=2, debug_out=None)
+    # 2) 1차 fetch (min_rows=252 → 1년 차트용. 캐시에 240일만 있던 트래커 종목도 yf에서 1년치 받음)
+    df = _fetch_price_inner(ticker, lookback, get_cache_buster(), min_rows=252, retries=2, debug_out=None)
 
-    # 3) 2차 보강(1차에서 비었을 때만)
+    # 3) 2차 보강(1차에서 비었을 때만. 신규상장 SNDK 등 256봉만 있는 종목은 min_rows 낮춰 재시도)
     if df is None or df.empty:
         df = _fetch_price_inner(ticker, 1400, get_cache_buster(), min_rows=0, retries=1, debug_out=None)
 
@@ -2049,6 +2090,11 @@ def analyze_ticker_reco(ticker: str, shares: float = 1.0, avg_price: Optional[fl
         buy_signal_dates, sell_signal_dates, sell_entry_prices, buy_reasons, sell_reasons = sc.backtest_signal_dates(df2, ticker)
     except Exception:
         pass
+
+    # ✅ tp.close: _current_close 단일 소스로 통일 (티커검색/트래커/포트폴리오 종가 일치)
+    display_close, _ = _current_close(ticker)
+    if display_close is not None and np.isfinite(display_close):
+        cur_close = display_close
 
     return {
         "ticker": ticker,
@@ -2390,6 +2436,156 @@ with tab1:
         last_sell_reason = (sell_reasons[-1] if sell_reasons else "") or "—"
         st.markdown(f"**최근 매수 신호:** {last_buy_str} — {last_buy_reason}")
         st.markdown(f"**최근 매도 신호:** {last_sell_str} — {last_sell_reason}")
+
+        # 종목 상태 상세 (시장상태상세 스타일, 스캐너 판단에 쓰는 지표 전부)
+        with st.expander("종목 상태 상세 (Ticker State)"):
+            _p = lambda s: f"<p style='color:#f1f5f9;font-size:1.05rem;margin:0.22rem 0;'>{s}</p>"
+            df_tail = res.get("df_tail")
+            if df_tail is not None and not df_tail.empty and len(df_tail) >= 2:
+                last = df_tail.iloc[-1]
+                prev = df_tail.iloc[-2]
+                close_val = float(last.get("Close", 0)) if "Close" in last else 0
+                open_val = float(last.get("Open", 0)) if "Open" in last else 0
+                high_val = float(last.get("High", 0)) if "High" in last else 0
+                low_val = float(last.get("Low", 0)) if "Low" in last else 0
+                prev_close = float(prev.get("Close", 0)) if "Close" in prev else close_val
+
+                col_t1, col_t2, col_t3 = st.columns(3)
+
+                def _add_item(col, label, val_str, badge):
+                    col.markdown(_p(f"{label}: {val_str} {badge}"), unsafe_allow_html=True)
+
+                with col_t1:
+                    # MACD
+                    macd_h = last.get("MACD_H")
+                    if macd_h is not None and np.isfinite(float(macd_h)):
+                        macd_h_f = float(macd_h)
+                        _add_item(col_t1, "MACD", "상승" if macd_h_f > 0 else "하락", "✅ good" if macd_h_f > 0 else "❌ bad")
+
+                    # RSI
+                    rsi_val = last.get("RSI14")
+                    if rsi_val is not None and np.isfinite(float(rsi_val)):
+                        rsi_f = float(rsi_val)
+                        if rsi_f < 30: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (과매도)", "✅ good")
+                        elif rsi_f > 70: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (과매수)", "❌ bad")
+                        else: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (적정)", "➖ normal")
+
+                    # 변동성(ATR%)
+                    atr14 = last.get("ATR14")
+                    if atr14 is not None and close_val > 0 and np.isfinite(float(atr14)):
+                        atr_pct = float(atr14) / close_val * 100
+                        if atr_pct < 2: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (낮음)", "❌ bad")
+                        elif atr_pct > 6: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (높음)", "❌ bad")
+                        else: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (적정)", "➖ normal")
+
+                    # ADX
+                    adx_val = last.get("ADX14")
+                    if adx_val is not None and np.isfinite(float(adx_val)):
+                        adx_f = float(adx_val)
+                        if adx_f >= 20: _add_item(col_t1, "ADX", f"{adx_f:.1f} (추세 있음)", "✅ good")
+                        elif adx_f < 15: _add_item(col_t1, "ADX", f"{adx_f:.1f} (횡보)", "❌ bad")
+                        else: _add_item(col_t1, "ADX", f"{adx_f:.1f} (보통)", "➖ normal")
+
+                    # SMA20
+                    sma20 = last.get("SMA20")
+                    if sma20 is not None and close_val > 0 and np.isfinite(float(sma20)):
+                        above = close_val > float(sma20)
+                        _add_item(col_t1, "SMA20", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+
+                    # SMA50
+                    sma50 = last.get("SMA50")
+                    if sma50 is not None and close_val > 0 and np.isfinite(float(sma50)):
+                        above = close_val > float(sma50)
+                        _add_item(col_t1, "SMA50", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+
+                    # SMA200
+                    sma200 = last.get("SMA200")
+                    if sma200 is not None and close_val > 0 and np.isfinite(float(sma200)):
+                        above = close_val > float(sma200)
+                        _add_item(col_t1, "SMA200", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+
+                with col_t2:
+                    # 이평 정렬 (SMA50 > SMA150 > SMA200)
+                    s50 = last.get("SMA50"); s150 = last.get("SMA150"); s200 = last.get("SMA200")
+                    if all(x is not None and np.isfinite(float(x)) for x in (s50, s150, s200)):
+                        stack = float(s50) > float(s150) > float(s200)
+                        _add_item(col_t2, "이평 정렬", "50>150>200" if stack else "정렬 아님", "✅ good" if stack else "❌ bad")
+
+                    # 20일 고점 근접도
+                    if len(df_tail) >= 21 and "High" in df_tail.columns:
+                        high20 = float(df_tail["High"].iloc[-21:-1].max())
+                        if high20 > 0:
+                            near_pct = close_val / high20 * 100
+                            if near_pct >= 98: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}% (근접)", "✅ good")
+                            elif near_pct < 95: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}% (멀음)", "➖ normal")
+                            else: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}%", "➖ normal")
+
+                    # 거래량 비율
+                    if "Volume" in df_tail.columns and len(df_tail) >= 20:
+                        vol = float(last.get("Volume", 0))
+                        vol20 = float(df_tail["Volume"].tail(20).mean())
+                        if vol20 > 0:
+                            vol_ratio = vol / vol20
+                            if vol_ratio >= 1.5: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x (강함)", "✅ good")
+                            elif vol_ratio < 0.7: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x (약함)", "❌ bad")
+                            else: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x", "➖ normal")
+
+                    # 윗꼬리 비율 (돌파 품질)
+                    if high_val > low_val and high_val > 0:
+                        rng = high_val - low_val
+                        upper_wick = (high_val - max(open_val, close_val)) / rng
+                        if upper_wick <= 0.3: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f} (낮음)", "✅ good")
+                        elif upper_wick >= 0.6: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f} (높음)", "❌ bad")
+                        else: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f}", "➖ normal")
+
+                    # 갭/ATR (추격 위험)
+                    if atr14 is not None and np.isfinite(float(atr14)) and float(atr14) > 0:
+                        gap_atr = (open_val - prev_close) / float(atr14)
+                        if gap_atr <= 1.0: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f} (적정)", "✅ good")
+                        elif gap_atr > 1.2: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f} (추격위험)", "❌ bad")
+                        else: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f}", "➖ normal")
+
+                    # 캔들 (양봉/음봉)
+                    bullish = close_val > open_val
+                    _add_item(col_t2, "캔들", "양봉" if bullish else "음봉", "✅ good" if bullish else "❌ bad")
+
+                with col_t3:
+                    # 종가 확인 (돌파 시 고점 위 마감) - 20D고점 대비
+                    if len(df_tail) >= 21 and "High" in df_tail.columns:
+                        high20_prev = float(df_tail["High"].iloc[-21:-1].max())
+                        if high20_prev > 0:
+                            close_confirm = close_val >= high20_prev * 1.001
+                            _add_item(col_t3, "종가확인(돌파)", "고점 위 마감" if close_confirm else "미확인", "✅ good" if close_confirm else "➖ normal")
+
+                    # 52주 고점 근접 (있으면)
+                    if len(df_tail) >= 252 and "High" in df_tail.columns:
+                        high52 = float(df_tail["High"].tail(252).max())
+                        if high52 > 0:
+                            pct_off = (high52 - close_val) / high52 * 100
+                            if pct_off <= 10: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래 (근접)", "✅ good")
+                            elif pct_off > 25: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래 (멀음)", "❌ bad")
+                            else: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래", "➖ normal")
+
+                    # 2일 연속 SMA20 이탈 (매도 컨펌)
+                    prev_sma20 = prev.get("SMA20") if "SMA20" in prev else None
+                    if sma20 is not None and prev_sma20 is not None and np.isfinite(float(sma20)) and np.isfinite(float(prev_sma20)):
+                        two_day_below = (close_val < float(sma20)) and (prev_close < float(prev_sma20))
+                        _add_item(col_t3, "2일연속<SMA20", "이탈" if two_day_below else "미이탈", "❌ bad" if two_day_below else "➖ normal")
+
+                    # 추세 (SMA50 > SMA200)
+                    if sma50 is not None and sma200 is not None and np.isfinite(float(sma50)) and np.isfinite(float(sma200)):
+                        uptrend = float(sma50) > float(sma200)
+                        _add_item(col_t3, "추세(50>200)", "상승" if uptrend else "하락", "✅ good" if uptrend else "❌ bad")
+
+                    # 눌림 구간 (SMA20/SMA50 근접)
+                    if sma20 is not None and sma50 is not None and np.isfinite(float(sma20)) and np.isfinite(float(sma50)) and float(sma20) > 0 and float(sma50) > 0:
+                        near_20 = abs(close_val / float(sma20) - 1) <= 0.015
+                        near_50 = abs(close_val / float(sma50) - 1) <= 0.0225
+                        if near_20 or near_50:
+                            _add_item(col_t3, "눌림 구간", "SMA 근접" if (near_20 or near_50) else "—", "➖ normal")
+            else:
+                st.markdown(_p("지표 데이터가 부족합니다."), unsafe_allow_html=True)
+
         if res.get("df_1y") is not None and not res["df_1y"].empty:
             st.markdown(
                 "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
@@ -2526,25 +2722,21 @@ with tab1:
         tr_all, closed_today = update_tracker_with_today(top3_buy_tickers, max_hold_days=15, run_date=run_date)
 
 
-        cdbg = tr_all[tr_all["Status"]=="CLOSED"].copy() if ("Status" in tr_all.columns) else pd.DataFrame()
-        if not cdbg.empty:
-            st.write("DEBUG CLOSED row(s):")
-            _render_aggrid(cdbg[["Ticker","SignalDate","EntryDate","EntryPrice","ExitDate","ExitPrice","ReturnPct","ExitReason"]], key="aggrid_cdbg")
-
         today = datetime.utcnow().date()
         cum = compute_cum_returns(tr_all, today=today)
-        st.write("DEBUG closed rows:", int((tr_all["Status"] == "CLOSED").sum()) if "Status" in tr_all.columns else "no Status")
-        st.write("DEBUG max ReturnPct:", float(pd.to_numeric(tr_all.get("ReturnPct", pd.Series([])), errors="coerce").max()) if "ReturnPct" in tr_all.columns else "no ReturnPct")
+        top_pick_ret = compute_open_avg_return(tr_all)
+        daily_change_avg = compute_open_daily_change_avg(tr_all)
 
-        open_avg = compute_open_avg_return(tr_all)
-
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric("일간 수익률(OPEN 평균)", f"{open_avg:.2f}%")
+        closed_count = int((tr_all["Status"] == "CLOSED").sum()) if "Status" in tr_all.columns else 0
+        k0, k1, k2, k3, k4, k5 = st.columns(6)
+        k0.metric("TOP PICK 수익률", f"{top_pick_ret:.2f}%")
+        k1.metric("일간 수익률", f"{daily_change_avg:.2f}%")
         k2.metric("월간 수익률(누적)", f"{cum['monthly']:.2f}%")
         k3.metric("연간 수익률(누적)", f"{cum['yearly']:.2f}%")
         k4.metric("총 수익률(누적)", f"{cum['total']:.2f}%")
+        k5.metric("추적 완료 종목", f"{closed_count}개")
 
-        st.caption("※ 누적 수익률은 '표에서 나간 종목(CLOSED)의 확정 수익률(ReturnPct)을 단순 합산'합니다.")
+        st.caption("※ TOP PICK 수익률: 현재 보유(OPEN) 종목들의 수익률 평균. 일간 수익률: 오늘 거래일 동안 변동된 수익률의 평균. 월간/연간/총 수익률: 해당 기간 CLOSED 종목들의 누적(복리) 수익률.")
 
         open_df = tr_all[tr_all["Status"] == "OPEN"].copy()
         if open_df.empty:
@@ -2587,7 +2779,7 @@ with tab1:
 
 with tab2:
     st.subheader("포트폴리오 관리")
-    path = "positions.csv"
+    path = os.path.join(BASE_DIR, "positions.csv")
     dfp = load_positions(path)
     if st.session_state.pop("portfolio_saved", False):
         st.success("저장되었습니다.")
@@ -2672,16 +2864,8 @@ with tab2:
                 risk_action = ""
                 rec = {}
 
-            # ✅ 현재가(종가) 가져오기: analyze_ticker_reco 결과(tp.close) 우선 사용
-            cur_close = None
-            try:
-                tp = rec.get("tp", {}) or {}
-                cur_close = tp.get("close", None)
-                if cur_close is None or (not np.isfinite(float(cur_close))):
-                    # fallback: yfinance로 한 번 더
-                    cur_close, _ = _current_close(t)
-            except Exception:
-                cur_close, _ = _current_close(t)
+            # ✅ 현재가(종가): _current_close 단일 소스 사용 (티커검색/트래커와 동일)
+            cur_close, _ = _current_close(t)
 
             # ✅ 수익률 계산 (AvgPrice 기준)
             ret_pct = None
@@ -3116,7 +3300,7 @@ with tab3:
     recos_df = _df(snap.get("recos_df"))
     top3     = _df(snap.get("top_picks"))
 
-    st.subheader("Top Picks (snapshot)")
+    st.subheader("TOP PICKS")
     if top3.empty:
         st.info("TOP PICK3 후보가 없습니다.")
     else:

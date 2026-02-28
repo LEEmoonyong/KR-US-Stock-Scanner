@@ -165,7 +165,12 @@ MAX_HOLD_DAYS_DEFAULT = 15      # 기본 최대 보유 거래일
 EARNINGS_WARNING_DAYS = 10   # 실적 발표 10일 이내면 ⚠ 실적 발표 N일 전
 
 # BUY/PROMOTED 강등: 실적 발표 N거래일 이내면 WATCH로 강등 (0~N거래일 이내면 적용)
-EARNINGS_DOWNGRADE_TRADING_DAYS = 5  # 실적 5거래일 앞두면 BUY/PROMOTED → WATCH_EARNINGS
+EARNINGS_DOWNGRADE_TRADING_DAYS = 15  # 실적 15거래일 앞두면 BUY/PROMOTED → WATCH_EARNINGS
+
+# yfinance가 실적일을 못 가져올 때 수동 오버라이드 (티커: "YYYY-MM-DD")
+EARNINGS_DATE_OVERRIDE = {
+    "ROST": "2026-03-04",  # 한국시간 3/4 06:15 실적발표 (미국 3/3 16:00 ET)
+}
 
 # 트레일링 스탑 여유 버퍼 (ATR 배수)
 SELL_TRAIL_ATR_BUFFER = 0.25
