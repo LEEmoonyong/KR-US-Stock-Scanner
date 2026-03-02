@@ -3103,8 +3103,8 @@ with st.sidebar:
     st.markdown(_nav_css + f"""
     <div style="display:flex;flex-direction:column;gap:2px;">
     <a href="?goto=home" target="_self" class="{_home_cls}"><span class="home-emoji-bg">🏠</span>Home</a>
-    <a href="?goto=us_scanner" target="_self" class="{_us_cls}"><span class="flag-bg"><img src="https://flagcdn.com/w160/us.png" alt=""></span><img class="nav-flag" src="https://flagcdn.com/w24/us.png" alt=""> US Stock Scanner</a>
-    <a href="?goto=kr_scanner" target="_self" class="{_kr_cls}"><span class="flag-bg"><img src="https://flagcdn.com/w160/kr.png" alt=""></span><img class="nav-flag" src="https://flagcdn.com/w24/kr.png" alt=""> KR Stock Scanner</a>
+    <a href="?goto=us_scanner" target="_self" class="{_us_cls}"><span class="flag-bg"><img src="https://flagcdn.com/w160/us.png" alt=""></span><img class="nav-flag" src="https://flagcdn.com/24x18/us.png" alt=""> US Stock Scanner</a>
+    <a href="?goto=kr_scanner" target="_self" class="{_kr_cls}"><span class="flag-bg"><img src="https://flagcdn.com/w160/kr.png" alt=""></span><img class="nav-flag" src="https://flagcdn.com/24x18/kr.png" alt=""> KR Stock Scanner</a>
     </div>
     """, unsafe_allow_html=True)
     page = _nav_current
