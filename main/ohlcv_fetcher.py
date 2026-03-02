@@ -133,6 +133,32 @@ def fetch_yfinance(ticker: str, start_date, end_date) -> Optional[pd.DataFrame]:
         return None
 
 
+def fetch_financedatareader_kr(ticker: str, start_date, end_date) -> Optional[pd.DataFrame]:
+    """한국 주식(.KS/.KQ) FinanceDataReader로 일봉 조회. yfinance 실패 시 폴백."""
+    if not ticker or (".KS" not in ticker.upper() and ".KQ" not in ticker.upper()):
+        return None
+    try:
+        import FinanceDataReader as fdr
+        code = ticker.replace(".KS", "").replace(".KQ", "").strip()
+        if not code or not code.isdigit():
+            return None
+        start_s = pd.Timestamp(start_date).strftime("%Y-%m-%d")
+        end_s = pd.Timestamp(end_date).strftime("%Y-%m-%d")
+        df = fdr.DataReader(code, start_s, end_s)
+        if df is None or df.empty:
+            return None
+        df.index = pd.to_datetime(df.index)
+        renames = {"시가": "Open", "고가": "High", "저가": "Low", "종가": "Close", "거래량": "Volume"}
+        df = df.rename(columns=renames)
+        need = ["Open", "High", "Low", "Close", "Volume"]
+        for c in need:
+            if c not in df.columns:
+                return None
+        return df[need].dropna(how="all")
+    except Exception:
+        return None
+
+
 def fetch_alpha_vantage(ticker: str, start_date, end_date, api_key: str) -> Optional[pd.DataFrame]:
     """Alpha Vantage TIME_SERIES_DAILY로 일봉 조회. outputsize=full."""
     if not api_key or not api_key.strip():
@@ -219,6 +245,15 @@ def fetch_ohlcv_with_fallback(
     if df is not None and len(df) >= min_rows:
         save_cached_ohlcv(ticker, df, db_path)
         return df
+
+    # 2b) 한국 주식: FinanceDataReader 폴백
+    if ".KS" in ticker.upper() or ".KQ" in ticker.upper():
+        df_fdr = fetch_financedatareader_kr(ticker, start_s, end_s)
+        if df_fdr is not None and len(df_fdr) >= min_rows:
+            save_cached_ohlcv(ticker, df_fdr, db_path)
+            return df_fdr
+        if df_fdr is not None and not df_fdr.empty:
+            df = df_fdr
 
     # 3) Alpha Vantage
     api_key = os.environ.get("ALPHA_VANTAGE_API_KEY", "").strip()

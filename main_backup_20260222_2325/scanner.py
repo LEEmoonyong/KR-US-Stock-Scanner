@@ -28,7 +28,8 @@ from tickers_blacklist import TICKER_BLACKLIST
 # ✅ 블랙리스트 반영(반드시 TICKERS가 정의된 이후에 적용)
 TICKERS = [t for t in TICKERS if t not in TICKER_BLACKLIST]
 
-
+# 스캐너 기준 디렉터리 (main/) — 모든 데이터 파일 경로의 기준
+SCANNER_BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 # -----------------------------
 # 캐시
@@ -46,7 +47,8 @@ def _load_meta_cache():
     if _meta_df is not None:
         return _meta_df
 
-    path = getattr(cfg, "META_CACHE_PATH", "meta_cache.csv")
+    rel_path = getattr(cfg, "META_CACHE_PATH", "meta_cache.csv")
+    path = os.path.join(SCANNER_BASE_DIR, rel_path) if not os.path.isabs(rel_path) else rel_path
     if os.path.exists(path):
         try:
             _meta_df = pd.read_csv(path)
@@ -65,7 +67,8 @@ def _save_meta_cache():
     global _meta_df
     if _meta_df is None:
         return
-    path = getattr(cfg, "META_CACHE_PATH", "meta_cache.csv")
+    rel_path = getattr(cfg, "META_CACHE_PATH", "meta_cache.csv")
+    path = os.path.join(SCANNER_BASE_DIR, rel_path) if not os.path.isabs(rel_path) else rel_path
     out = _meta_df.reset_index()
     out.to_csv(path, index=False, encoding="utf-8-sig")
 
@@ -192,6 +195,14 @@ def _get_df_for_regime(data, ticker: str):
     return None
 
 
+# 섹터 ETF(5일 수익률 Top3용)
+SECTOR_ETFS_5D = [
+    ("XLK", "Technology"), ("XLF", "Financials"), ("XLV", "Healthcare"), ("XLE", "Energy"),
+    ("XLY", "Consumer Cyclical"), ("XLP", "Consumer Defensive"), ("XLI", "Industrial"),
+    ("XLB", "Materials"), ("XLU", "Utilities"),
+]
+
+
 def compute_market_state_from_data(data):
     """
     다지표 종합 시장 레짐 (100점 만점).
@@ -213,6 +224,7 @@ def compute_market_state_from_data(data):
         "spy_vol_ratio": None,
         "sector_qqq_vs_xlp": None,
         "components": {},
+        "sector_5d_return_top3": [],
     }
     df_spy = _get_df_for_regime(data, "SPY")
     if df_spy is None or df_spy.empty:
@@ -332,6 +344,25 @@ def compute_market_state_from_data(data):
         out["regime"] = "CAUTION"
     else:
         out["regime"] = "RISK_ON"
+
+    # 최근 5거래일 수익률 높은 섹터 Top3
+    sector_returns = []
+    for ticker, name in SECTOR_ETFS_5D:
+        df = _get_df_for_regime(data, ticker)
+        if df is None or not hasattr(df, "columns") or "Close" not in df.columns or len(df) < 6:
+            continue
+        close = df["Close"].dropna()
+        if len(close) < 6:
+            continue
+        try:
+            ret_5d = (float(close.iloc[-1]) / float(close.iloc[-6]) - 1.0) * 100.0
+            if np.isfinite(ret_5d):
+                sector_returns.append({"name": name, "ticker": ticker, "return_5d": round(ret_5d, 2)})
+        except Exception:
+            continue
+    sector_returns.sort(key=lambda x: x["return_5d"], reverse=True)
+    out["sector_5d_return_top3"] = sector_returns[:3]
+
     return out
 
 
@@ -1130,13 +1161,24 @@ def _trading_days_between(ref_date, end_date) -> int:
 
 
 def _next_earnings_date(ticker: str, ref_date) -> Optional[object]:
-    """다음 실적 발표일(date). 없으면 None."""
+    """다음 실적 발표일(date). 없으면 None. 수동 오버라이드 우선 적용."""
     try:
         if hasattr(ref_date, "date"):
             ref_date = ref_date.date()
         ref_date = pd.Timestamp(ref_date).date()
     except Exception:
         return None
+    # ✅ 수동 오버라이드 (yfinance가 실적일 못 가져올 때)
+    override = getattr(cfg, "EARNINGS_DATE_OVERRIDE", None) or {}
+    if isinstance(override, dict):
+        t_upper = str(ticker).upper().strip()
+        if t_upper in override:
+            try:
+                ed = pd.Timestamp(override[t_upper]).date()
+                if ed >= ref_date:
+                    return ed
+            except Exception:
+                pass
     future_dates = []
     try:
         t = yf.Ticker(ticker)
@@ -1702,7 +1744,8 @@ def backtest_signal_dates(df2: pd.DataFrame, ticker: str):
     - buy_reasons: buy_dates와 동일 순서로, 각 매수 신호 근거(진입 타입/트리거) 문자열.
     - sell_reasons: sell_dates와 동일 순서로, 각 매도 신호 근거(Reason 또는 Action) 문자열.
     """
-    if df2 is None or len(df2) < 260:
+    # SMA200 유효 구간(start_i=200)부터 루프. 최소 201봉 필요. 상장 기간 짧은 종목(SNDK 256봉 등)도 신호 표시
+    if df2 is None or len(df2) < 201:
         return [], [], [], [], []
     buy_dates = []
     sell_dates = []
@@ -2538,9 +2581,10 @@ def score_stock(df, ticker, market_state=None, data=None):
             note = (str(note) + f" | 추세없음(ADX {adx14:.1f} < {min_adx})").strip(" |")
 
     # ✅ Relative Strength (시장 대비 강도): SPY보다 약하면 BUY → WATCH_RS
+    # BUY/WATCH 모두 RS_vs_SPY 표시
     rs_txt = None
     rs_lookback = int(getattr(cfg, "RS_LOOKBACK_DAYS", 20))
-    if str(entry).startswith("BUY_") and data is not None:
+    if (str(entry).startswith("BUY_") or str(entry).startswith("WATCH_")) and data is not None:
         spy_close = None
         try:
             if isinstance(data.columns, pd.MultiIndex):
@@ -2554,7 +2598,7 @@ def score_stock(df, ticker, market_state=None, data=None):
             stock_ret, spy_ret = compute_rs_vs_spy(df2, spy_close, rs_lookback)
             if stock_ret is not None and spy_ret is not None:
                 rs_txt = f"종목 {stock_ret*100:.1f}% vs SPY {spy_ret*100:.1f}%"
-                if stock_ret <= spy_ret:
+                if str(entry).startswith("BUY_") and stock_ret <= spy_ret:
                     entry = "WATCH_RS"
                     note = (str(note) + f" | 시장대비 약함(RS {rs_lookback}일: {rs_txt})").strip(" |")
 
@@ -3386,29 +3430,28 @@ def embed_for_risk(risk_df, run_date):
 # 메인 (속도 개선 + WATCH 별도 + 시총 선호 가산점 + 보유 매도/익절 신호)
 # -----------------------------
 def main():
-    # ✅ 안전 초기화 (먼저 선언부터)
+    # ✅ 안전 초기화. run_date = 로컬 날짜(스캐너를 돌린 날 → 트래커 Signal/Entry에 사용, UTC쓰면 23일로 밀리는 현상 방지)
     run_date = ""
     skip_reasons = []  # (ticker, reason)
-    end = datetime.now(timezone.utc).date()
+    end = datetime.now().date()
     start = end - timedelta(days=cfg.LOOKBACK_DAYS)
     run_date = str(end)
 
-    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-    SNAPSHOTS_DIR = os.path.join(BASE_DIR, "snapshots")
-    SCAN_CSV_DIR = os.path.join(BASE_DIR, "scan_csv")
+    SNAPSHOTS_DIR = os.path.join(SCANNER_BASE_DIR, "snapshots")
+    SCAN_CSV_DIR = os.path.join(SCANNER_BASE_DIR, "scan_csv")
     os.makedirs(SNAPSHOTS_DIR, exist_ok=True)
     os.makedirs(SCAN_CSV_DIR, exist_ok=True)
 
     results = []
 
-    # ✅ 보유 포지션 로드
-    pos = load_positions("positions.csv")
+    # ✅ 보유 포지션 로드 (main/ 기준)
+    pos = load_positions(os.path.join(SCANNER_BASE_DIR, "positions.csv"))
     pos_tickers = []
     if not pos.empty:
         pos_tickers = pos["Ticker"].astype(str).str.upper().tolist()
 
     # ✅ 전체 티커(스캔 + 보유 + 시장지수)
-    bench = ["SPY", "QQQ", "IWM", "^VIX", "XLP"]
+    bench = ["SPY", "QQQ", "IWM", "^VIX", "XLP", "XLK", "XLF", "XLV", "XLE", "XLY", "XLI", "XLB", "XLU"]
     scan_universe = [t.upper() for t in TICKERS if t.upper() not in TICKER_BLACKLIST]
     all_tickers = sorted(list(set(scan_universe + pos_tickers + bench)))
 
@@ -3512,6 +3555,7 @@ def main():
         "WATCH_52WK": 4,
         "WATCH_MA_STACK": 4,
         "WATCH_FUNDAMENTAL": 4,
+        "WATCH_EARNINGS": 4,
         "CANDIDATE_BUY": 5,
         "SKIP": 9
     }
@@ -3547,6 +3591,78 @@ def main():
     # -----------------------------
     # ✅ WATCH는 df_all에서 따로 뽑아서 cfg.WATCH_LIMIT까지 보여주기
     # -----------------------------
+    watch_df_all = df_all[df_all["Entry"].astype(str).str.startswith("WATCH_")].copy()
+    if cfg.USE_SECTOR_CAP:
+        picked_w = []
+        counts_w = {}
+        for _, row in watch_df_all.iterrows():
+            sec = row.get("Sector", "Unknown") or "Unknown"
+            if counts_w.get(sec, 0) >= cfg.MAX_PER_SECTOR:
+                continue
+            picked_w.append(row)
+            counts_w[sec] = counts_w.get(sec, 0) + 1
+            if len(picked_w) >= cfg.WATCH_LIMIT:
+                break
+        watch_df = pd.DataFrame(picked_w)
+    else:
+        watch_df = watch_df_all.head(cfg.WATCH_LIMIT).copy()
+
+    # -----------------------------
+    # ✅ 실적 N거래일 이내 BUY → WATCH 강등 (SMART_RELAX보다 먼저!)
+    # -----------------------------
+    downgrade_trading_days = int(getattr(cfg, "EARNINGS_DOWNGRADE_TRADING_DAYS", 5))
+    if downgrade_trading_days >= 0 and buy_df is not None and not buy_df.empty and "Ticker" in buy_df.columns:
+        try:
+            ref_date = pd.Timestamp(run_date).date() if run_date else datetime.now(timezone.utc).date()
+        except Exception:
+            ref_date = datetime.now(timezone.utc).date()
+        keep_buy = []
+        downgraded = []
+        for _, row in buy_df.iterrows():
+            t = str(row.get("Ticker", "")).upper().strip()
+            if not t:
+                keep_buy.append(row)
+                continue
+            trading_days_ahead = _trading_days_until_next_earnings(t, ref_date)
+            if trading_days_ahead is not None and 0 <= trading_days_ahead <= downgrade_trading_days:
+                r = row.to_dict()
+                r["Entry"] = "WATCH_EARNINGS"
+                r["EntryRaw"] = r.get("EntryRaw", row.get("Entry", ""))
+                r["Promoted"] = False
+                r["PromoTag"] = ""
+                orig_note = str(r.get("Note", "")).strip()
+                r["Note"] = (orig_note + " [실적 " + str(trading_days_ahead) + "거래일 전 → WATCH 강등]").strip(" |")
+                downgraded.append(r)
+            else:
+                keep_buy.append(row)
+        if downgraded:
+            buy_df = pd.DataFrame(keep_buy).reset_index(drop=True) if keep_buy else pd.DataFrame()
+            downgraded_df = pd.DataFrame(downgraded)
+            if not watch_df.empty and len(watch_df.columns) > 0:
+                for c in watch_df.columns:
+                    if c not in downgraded_df.columns:
+                        downgraded_df[c] = np.nan
+                downgraded_df = downgraded_df.reindex(columns=watch_df.columns, fill_value=np.nan)
+            watch_df = pd.concat([watch_df, downgraded_df], ignore_index=True)
+
+            downgraded_tickers = {str(r.get("Ticker", "")).upper().strip() for r in downgraded if r.get("Ticker")}
+            for t in downgraded_tickers:
+                if not t:
+                    continue
+                r = next((x for x in downgraded if str(x.get("Ticker", "")).upper().strip() == t), None)
+                if r is None:
+                    continue
+                for target in [df_out, df_all]:
+                    if target is None or target.empty or "Ticker" not in target.columns:
+                        continue
+                    mask = target["Ticker"].astype(str).str.upper().str.strip() == t
+                    if mask.any():
+                        target.loc[mask, "Entry"] = r.get("Entry", "WATCH_EARNINGS")
+                        if "EntryRaw" in target.columns:
+                            target.loc[mask, "EntryRaw"] = r.get("EntryRaw", "")
+                        if "Note" in target.columns:
+                            target.loc[mask, "Note"] = r.get("Note", "")
+
     # ✅ (안전) Promoted 기본값
     if "Promoted" not in df_out.columns:
         df_out["Promoted"] = False
@@ -3739,61 +3855,6 @@ def main():
     # BUY 리스트를 EV(기대값) 순으로 정렬 — 상단일수록 더 투자하기 좋은 순서
     if buy_df is not None and not buy_df.empty:
         buy_df = ev_rank_top_picks(buy_df, n=cfg.MAX_BUY_PER_DAY)
-
-    watch_df_all = df_all[df_all["Entry"].astype(str).str.startswith("WATCH_")].copy()
-
-    if cfg.USE_SECTOR_CAP:
-        picked_w = []
-        counts_w = {}
-        for _, row in watch_df_all.iterrows():
-            sec = row.get("Sector", "Unknown") or "Unknown"
-            if counts_w.get(sec, 0) >= cfg.MAX_PER_SECTOR:
-                continue
-            picked_w.append(row)
-            counts_w[sec] = counts_w.get(sec, 0) + 1
-            if len(picked_w) >= cfg.WATCH_LIMIT:
-                break
-        watch_df = pd.DataFrame(picked_w)
-    else:
-        watch_df = watch_df_all.head(cfg.WATCH_LIMIT).copy()
-
-    # -----------------------------
-    # ✅ 실적 N거래일 이내 BUY/PROMOTED → WATCH 강등
-    # -----------------------------
-    downgrade_trading_days = int(getattr(cfg, "EARNINGS_DOWNGRADE_TRADING_DAYS", 5))
-    if downgrade_trading_days >= 0 and buy_df is not None and not buy_df.empty and "Ticker" in buy_df.columns:
-        try:
-            ref_date = pd.Timestamp(run_date).date() if run_date else datetime.now(timezone.utc).date()
-        except Exception:
-            ref_date = datetime.now(timezone.utc).date()
-        keep_buy = []
-        downgraded = []
-        for _, row in buy_df.iterrows():
-            t = str(row.get("Ticker", "")).upper().strip()
-            if not t:
-                keep_buy.append(row)
-                continue
-            trading_days_ahead = _trading_days_until_next_earnings(t, ref_date)
-            if trading_days_ahead is not None and 0 <= trading_days_ahead <= downgrade_trading_days:
-                r = row.to_dict()
-                r["Entry"] = "WATCH_EARNINGS"
-                r["EntryRaw"] = r.get("EntryRaw", row.get("Entry", ""))
-                r["Promoted"] = False
-                r["PromoTag"] = ""
-                orig_note = str(r.get("Note", "")).strip()
-                r["Note"] = (orig_note + " [실적 " + str(trading_days_ahead) + "거래일 전 → WATCH 강등]").strip(" |")
-                downgraded.append(r)
-            else:
-                keep_buy.append(row)
-        if downgraded:
-            buy_df = pd.DataFrame(keep_buy).reset_index(drop=True) if keep_buy else pd.DataFrame()
-            downgraded_df = pd.DataFrame(downgraded)
-            if not watch_df.empty and len(watch_df.columns) > 0:
-                for c in watch_df.columns:
-                    if c not in downgraded_df.columns:
-                        downgraded_df[c] = np.nan
-                downgraded_df = downgraded_df.reindex(columns=watch_df.columns, fill_value=np.nan)
-            watch_df = pd.concat([watch_df, downgraded_df], ignore_index=True)
 
     # -----------------------------
     # ✅ 보유 포지션 매도/익절 신호 (이미 받은 data 재사용)
@@ -4014,7 +4075,7 @@ if __name__ == "__main__":
         raise SystemExit
 
     if args.mode == "portfolio":
-        portfolio_edit_loop("positions.csv")
+        portfolio_edit_loop(os.path.join(SCANNER_BASE_DIR, "positions.csv"))
         raise SystemExit
 
     # 여기부터는 "진짜 터미널에서 직접 실행"할 때만 메뉴 띄움
@@ -4027,7 +4088,7 @@ if __name__ == "__main__":
     if mode == "2":
         query_loop()
     elif mode == "3":
-        portfolio_edit_loop("positions.csv")
+        portfolio_edit_loop(os.path.join(SCANNER_BASE_DIR, "positions.csv"))
     else:
         main()
 

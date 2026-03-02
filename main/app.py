@@ -1,5 +1,6 @@
 import html
 import math
+import re
 import os
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
@@ -36,6 +37,32 @@ except Exception:
 import sys
 import subprocess
 import subprocess, sys, time
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+
+try:
+    import requests
+except ImportError:
+    requests = None
+try:
+    import feedparser
+except ImportError:
+    feedparser = None
+try:
+    from trafilatura import extract, html2txt
+    _HAS_TRAFILATURA = True
+except ImportError:
+    _HAS_TRAFILATURA = False
+    html2txt = None
+try:
+    from googlenewsdecoder import gnewsdecoder
+    _HAS_GNEWS_DECODER = True
+except ImportError:
+    _HAS_GNEWS_DECODER = False
+# Fragment: Streamlit 1.33+ (탭별 독립 리런으로 속도 향상)
+_st_fragment = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", lambda f: f)
+
 # (app.py) 파일 상단 근처
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 SNAPSHOT_PATTERN = os.path.join(BASE_DIR, "snapshots", "scan_snapshot_*.json")
@@ -183,7 +210,7 @@ def _dark_table_style(df: pd.DataFrame):
 
 
 # ---------- AgGrid: 참고 이미지와 동일한 다크 테마 표 (theme=dark + custom_css + Return% 색상) ----------
-def _prepare_df_for_aggrid(df: pd.DataFrame) -> pd.DataFrame:
+def _prepare_df_for_aggrid(df: pd.DataFrame, kr_currency: bool = False) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()
@@ -199,6 +226,26 @@ def _prepare_df_for_aggrid(df: pd.DataFrame) -> pd.DataFrame:
                 try: return pd.Timestamp(v).strftime("%Y-%m-%d")
                 except Exception: return str(v)[:10] if len(str(v)) >= 10 else str(v)
             out[c] = out[c].apply(_d)
+    # 원화: 가격·거래량 등만 소수점 제거 (EV·Prob·RR·Score 등은 소수점 유지)
+    if kr_currency:
+        def _is_price_col(c):
+            if c in ("Close", "Open", "High", "Low", "Volume", "EntryPrice", "ExitPrice",
+                     "EntryPrice(PrevClose)", "Close(Now)", "MktCap_KRW_T", "PosValue", "Avg$Vol", "Shares"):
+                return True
+            if isinstance(c, str) and (c.startswith("SMA") or (c.startswith("ATR") and "%" not in c)):
+                return True
+            return False
+        price_cols = [c for c in out.columns if _is_price_col(c)]
+        for c in price_cols:
+            if c in out.columns and out[c].dtype.kind in "fc":
+                def _round_int(v):
+                    if pd.isna(v): return v
+                    try:
+                        f = float(v)
+                        return int(round(f)) if np.isfinite(f) else v
+                    except (TypeError, ValueError):
+                        return v
+                out[c] = out[c].apply(_round_int)
     return out
 
 def _aggrid_dark_css() -> dict:
@@ -262,8 +309,8 @@ def _build_aggrid_options(df: pd.DataFrame):
     go["columnDefs"] = [c for c in col_defs if c.get("field") in valid_fields]
     return go
 
-def _render_aggrid(df, key: str, height: int = 400):
-    """참고 이미지와 동일한 다크 테마 AgGrid. 표시 전용."""
+def _render_aggrid(df, key: str, height: int = 400, kr_currency: bool = False):
+    """참고 이미지와 동일한 다크 테마 AgGrid. 표시 전용. kr_currency=True면 원화(소수점 없음)."""
     if not _HAS_AGGRID:
         st.dataframe(_dark_table_style(df), use_container_width=True)
         return
@@ -271,7 +318,7 @@ def _render_aggrid(df, key: str, height: int = 400):
         st.dataframe(_dark_table_style(df), use_container_width=True)
         return
     try:
-        display_df = _prepare_df_for_aggrid(df)
+        display_df = _prepare_df_for_aggrid(df, kr_currency=kr_currency)
         go = _build_aggrid_options(display_df)
         n = max(3, min(25, len(display_df)))
         h = min(500, 80 + n * 36)
@@ -303,17 +350,21 @@ function(params) {
 }
 """) if _HAS_AGGRID else None
 
-def _tracker_table_html(rows: List[dict]) -> str:
-    """성과 추적 표를 HTML 문자열로 생성. Return% 셀에 수익=초록/손실=빨강 인라인 스타일 적용."""
+def _tracker_table_html(rows: List[dict], use_name: bool = False, price_no_decimals: bool = False) -> str:
+    """성과 추적 표를 HTML 문자열로 생성. Return% 셀에 수익=초록/손실=빨강 인라인 스타일 적용.
+    use_name: 첫 열을 Name(종목명)으로 표시. price_no_decimals: Entry/Close 가격 소수점 제거."""
     if not rows:
         return ""
-    headers = ["Ticker", "Signal Date", "Entry Date", "Entry Price (Prev Close)", "Close (Now)", "Return%", "Days Held"]
+    first_key = "Name" if (use_name and rows and "Name" in rows[0]) else "Ticker"
+    first_header = "Name" if first_key == "Name" else "Ticker"
+    headers = [first_header, "Signal Date", "Entry Date", "Entry Price (Prev Close)", "Close (Now)", "Return%", "Days Held"]
+    price_kind = "num_int" if price_no_decimals else "num"
     key_map = [
-        ("Ticker", "ticker"),
+        (first_key, "ticker"),
         ("SignalDate", "date"),
         ("EntryDate", "date"),
-        ("EntryPrice(PrevClose)", "num"),
-        ("Close(Now)", "num"),
+        ("EntryPrice(PrevClose)", price_kind),
+        ("Close(Now)", price_kind),
         ("Return%", "pct"),
         ("DaysHeld", "num"),
     ]
@@ -344,6 +395,12 @@ def _tracker_table_html(rows: List[dict]) -> str:
                 else:
                     txt = f"{float(val):,.2f}" if isinstance(val, (int, float)) else str(val)
                 parts.append(f'<td style="{td_base} text-align:right;font-weight:600;">{html.escape(txt)}</td>')
+            elif kind == "num_int":
+                if val is None or (isinstance(val, float) and not np.isfinite(val)):
+                    txt = ""
+                else:
+                    txt = f"{int(round(float(val))):,}" if isinstance(val, (int, float)) else str(val)
+                parts.append(f'<td style="{td_base} text-align:right;font-weight:600;">{html.escape(txt)}</td>')
             elif kind == "pct":
                 try:
                     n = float(val) if val is not None else 0.0
@@ -362,22 +419,24 @@ def _tracker_table_html(rows: List[dict]) -> str:
     return "".join(parts)
 
 
-def _render_tracker_aggrid(rows: List[dict]) -> None:
-    """신호 성과 추적 표 렌더. st.dataframe은 셀별 색상을 지원하지 않으므로 HTML 표로 렌더해 수익=초록/손실=빨강 적용."""
+def _render_tracker_aggrid(rows: List[dict], use_name: bool = False, price_no_decimals: bool = False) -> None:
+    """신호 성과 추적 표 렌더. st.dataframe은 셀별 색상을 지원하지 않으므로 HTML 표로 렌더해 수익=초록/손실=빨강 적용.
+    use_name: Name(종목명) 열 사용. price_no_decimals: Entry/Close 가격 소수점 제거."""
     if not rows:
         st.info("표시할 데이터가 없습니다.")
         return
-    html_table = _tracker_table_html(rows)
+    html_table = _tracker_table_html(rows, use_name=use_name, price_no_decimals=price_no_decimals)
     if html_table:
         st.markdown(html_table, unsafe_allow_html=True)
     else:
         st.info("표시할 데이터가 없습니다.")
 
 
-def _dataframe_to_tracker_style_html(df: pd.DataFrame, pct_colors: bool = False, col_widths: Optional[List[str]] = None) -> str:
+def _dataframe_to_tracker_style_html(df: pd.DataFrame, pct_colors: bool = False, col_widths: Optional[List[str]] = None, kr_currency: bool = False) -> str:
     """DataFrame을 성과추적 표와 동일한 다크 테마 HTML 표로 변환. Ticker 열 ■+초록.
     pct_colors=True면 수익률 열 초록/빨강(성과추적표처럼), False면 흰색(스캐너용).
-    col_widths를 주면 열 비율 고정(예: ["18%%", "27%%", "27%%", "28%%"])."""
+    col_widths를 주면 열 비율 고정(예: ["18%%", "27%%", "27%%", "28%%"]).
+    kr_currency=True면 원화(소수점 없음) 포맷."""
     if df is None or df.empty:
         return ""
     wrap = "width:100%;max-height:38vh;overflow-x:auto;overflow-y:auto;border-radius:10px;box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);margin:0.4rem 0;"
@@ -403,7 +462,7 @@ def _dataframe_to_tracker_style_html(df: pd.DataFrame, pct_colors: bool = False,
         parts.append("<tr>")
         for i, c in enumerate(cols):
             val = row.get(c)
-            is_ticker = (c == "Ticker" or (i == 0 and "ticker" in str(c).lower()))
+            is_ticker = (c == "Ticker" or c == "Name" or (i == 0 and "ticker" in str(c).lower()))
             is_pct = ("return" in str(c).lower() or "pct" in str(c).lower() or "%" in str(c))
             if is_ticker:
                 txt = (str(val).strip() if val is not None and pd.notna(val) else "")
@@ -420,7 +479,18 @@ def _dataframe_to_tracker_style_html(df: pd.DataFrame, pct_colors: bool = False,
                 else:
                     parts.append(f'<td style="{td_base} text-align:right;font-weight:600;">{html.escape(txt)}</td>')
             elif isinstance(val, (int, float)) and np.isfinite(val):
-                txt = f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
+                # 원화 관련만 소수점 제거(시가총액·종가·거래량 등), EV·Prob·RR·Score 등은 소수점 유지
+                _kr_int_cols = ("Close", "Open", "High", "Low", "Volume", "MktCap_KRW_T",
+                                "EntryPrice", "StopPrice", "TargetPrice", "PosValue", "Avg$Vol",
+                                "Shares", "EntryPrice(PrevClose)", "Close(Now)")
+                _is_kr_int = kr_currency and (
+                    c in _kr_int_cols
+                    or (isinstance(c, str) and (c.startswith("SMA") or (c.startswith("ATR") and "%" not in str(c))))
+                )
+                if _is_kr_int:
+                    txt = f"{val:,.0f}"
+                else:
+                    txt = f"{val:,.2f}" if isinstance(val, float) else f"{val:,}"
                 parts.append(f'<td style="{td_base} text-align:right;font-weight:600;">{html.escape(txt)}</td>')
             else:
                 try:
@@ -440,12 +510,12 @@ def _dataframe_to_tracker_style_html(df: pd.DataFrame, pct_colors: bool = False,
 _TP_STOP_COL_WIDTHS = ["18%", "27%", "27%", "28%"]
 
 
-def _render_tracker_style_table(df: pd.DataFrame, pct_colors: bool = False, col_widths: Optional[List[str]] = None) -> None:
-    """DataFrame을 성과추적 표와 동일한 HTML 스타일로 렌더. pct_colors=True면 수익률 열 초록/빨강. col_widths로 열 비율 고정."""
+def _render_tracker_style_table(df: pd.DataFrame, pct_colors: bool = False, col_widths: Optional[List[str]] = None, kr_currency: bool = False) -> None:
+    """DataFrame을 성과추적 표와 동일한 HTML 스타일로 렌더. pct_colors=True면 수익률 열 초록/빨강. col_widths로 열 비율 고정. kr_currency=True면 원화(소수점 없음)."""
     if df is None or df.empty:
         st.info("표시할 데이터가 없습니다.")
         return
-    html_table = _dataframe_to_tracker_style_html(df, pct_colors=pct_colors, col_widths=col_widths)
+    html_table = _dataframe_to_tracker_style_html(df, pct_colors=pct_colors, col_widths=col_widths, kr_currency=kr_currency)
     if html_table:
         st.markdown(html_table, unsafe_allow_html=True)
 
@@ -454,6 +524,316 @@ def get_cache_buster():
     """강제 새로고침/스캔 실행 시 data_refresh_ts가 설정되면 캐시 키가 바뀌어 미국 최근 종가 기준으로 재조회됨."""
     ts = st.session_state.get("data_refresh_ts", "")
     return APP_VERSION + ("_" + str(ts) if ts else "")
+
+
+def _strip_html_summary(raw: str, max_len: int = 200) -> str:
+    """HTML 태그 제거 후 깔끔한 요약 텍스트 반환 (최대 max_len자)."""
+    if not raw or not str(raw).strip():
+        return ""
+    s = re.sub(r"<[^>]+>", " ", str(raw))
+    s = re.sub(r"\s+", " ", s).strip()
+    s = html.unescape(s)
+    return (s[:max_len] + "…") if len(s) > max_len else s
+
+
+try:
+    from article_summary_utils import clean_article_noise, extract_3_sentences, validate_summary
+except ImportError:
+    def clean_article_noise(t): return (re.sub(r"\s+", " ", t).strip() if t else "")
+    def extract_3_sentences(t, title=""): return (re.sub(r"\s+", " ", t).strip()[:300] if t else "")
+    def validate_summary(s, t=""): return (s if s else "")
+
+
+def _resolve_google_news_url(url: str) -> str:
+    """구글 뉴스 리다이렉트 URL을 실제 기사 URL로 변환."""
+    if not url or "news.google.com" not in url:
+        return url
+    if _HAS_GNEWS_DECODER:
+        try:
+            res = gnewsdecoder(url, interval=0)
+            if res and res.get("status") and res.get("decoded_url"):
+                return str(res["decoded_url"]).strip()
+        except Exception:
+            pass
+    return url
+
+
+def _fetch_article_html(url: str) -> str:
+    """기사 URL HTML 가져오기. 구글 뉴스 URL은 먼저 실제 URL로 변환."""
+    url = _resolve_google_news_url(url)
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
+    if requests:
+        try:
+            r = requests.get(url, headers=headers, timeout=8, allow_redirects=True)
+            if r.ok and r.text:
+                return r.text
+        except Exception:
+            pass
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8) as resp:
+            return resp.read().decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60)
+def _summarize_article_from_url(url: str, article_title: str = "", _cache_buster: str = "") -> str:
+    """기사 URL에서 본문 추출 후 3줄 요약. article_title로 관련성 검증."""
+    if not url or not str(url).strip():
+        return ""
+    html_content = _fetch_article_html(url)
+    if not html_content or len(html_content) < 500:
+        return ""
+    if _HAS_TRAFILATURA:
+        try:
+            result = extract(html_content, no_fallback=False)
+            if not result or len(result.strip()) < 50:
+                result = (html2txt(html_content) or "") if html2txt else ""
+            if result and len(result.strip()) >= 50:
+                raw = extract_3_sentences(result, article_title)
+                return validate_summary(raw, article_title)
+        except Exception:
+            pass
+    return ""
+
+
+def _is_meaningful_rss_summary(rss: str, title: str) -> bool:
+    """RSS 요약이 제목과 다른 실제 내용인지 확인 (제목과 동일하면 False)."""
+    if not rss or not rss.strip() or len(rss.strip()) <= 30:
+        return False
+    rss = rss.strip()
+    title = (title or "").strip()
+    if not title:
+        return True
+    if rss == title:
+        return False
+    if title in rss and len(rss) < len(title) * 1.4:
+        return False
+    if rss in title:
+        return False
+    rss_wo_title = rss.replace(title, "").strip()
+    if len(rss_wo_title) < 20:
+        return False
+    return True
+
+
+def _enrich_news_with_summaries(items: list, cache_buster: str = "") -> list:
+    """기사 목록에 실제 본문 기반 3줄 요약 추가 (병렬). 제목과 같은 RSS 요약은 사용 안 함."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    out = []
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        futures = {ex.submit(_summarize_article_from_url, n.get("link", ""), n.get("title", ""), cache_buster): i for i, n in enumerate(items)}
+        summaries = [""] * len(items)
+        for f in as_completed(futures, timeout=35):
+            i = futures[f]
+            try:
+                summaries[i] = f.result() or ""
+            except Exception:
+                pass
+    for i, n in enumerate(items):
+        s = summaries[i] if i < len(summaries) else ""
+        if not s:
+            rss = (n.get("rss_summary") or "").strip()
+            title = (n.get("title") or "").strip()
+            if _is_meaningful_rss_summary(rss, title):
+                s = rss
+        out.append({**n, "summary": s})
+    return out
+
+
+def _format_pub_kr(pub_raw: str = "", parsed: Optional[tuple] = None) -> str:
+    """발행일을 '2026년 2월 24일 12시 34분' 형식으로 변환."""
+    if parsed and len(parsed) >= 6:
+        return f"{parsed[0]}년 {parsed[1]}월 {parsed[2]}일 {parsed[3]}시 {parsed[4]}분"
+    if not pub_raw or not str(pub_raw).strip():
+        return ""
+    pub_raw = str(pub_raw).strip()
+    try:
+        if "T" in pub_raw:
+            s = pub_raw.replace("Z", "+00:00").replace("+00:00", "")[:19]
+            dt = datetime.fromisoformat(s)
+            return f"{dt.year}년 {dt.month}월 {dt.day}일 {dt.hour}시 {dt.minute}분"
+    except Exception:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(pub_raw)
+        return f"{dt.year}년 {dt.month}월 {dt.day}일 {dt.hour}시 {dt.minute}분"
+    except Exception:
+        pass
+    return pub_raw[:20]
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 15)
+def _fetch_market_news_raw(region: str) -> tuple:
+    """RSS에서 시장 주요 기사 최대 10개 수집. (items, error_msg) 반환."""
+    if region == "us":
+        q = urllib.parse.quote("US stock market Wall Street")
+        urls = [f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"]
+    else:
+        q = urllib.parse.quote("한국 증시 주식 코스피")
+        urls = [f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"]
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"}
+    last_err = ""
+    for url in urls:
+        if feedparser is not None:
+            try:
+                parsed = feedparser.parse(url, request_headers=headers)
+                entries = getattr(parsed, "entries", [])[:10]
+                items = []
+                for e in entries:
+                    title = (e.get("title") or "").strip()
+                    link = (e.get("link") or "").strip()
+                    parsed = e.get("published_parsed") or e.get("updated_parsed")
+                    pub_raw = e.get("published") or e.get("updated") or ""
+                    pub = _format_pub_kr(pub_raw, parsed)
+                    src = e.get("source")
+                    source = ""
+                    if src:
+                        try:
+                            source = (src.get("title") if hasattr(src, "get") else getattr(src, "title", "") or "").strip()
+                        except Exception:
+                            pass
+                    summary_raw = e.get("summary") or e.get("description") or ""
+                    if not summary_raw and e.get("content"):
+                        cnt = e.get("content")
+                        summary_raw = cnt[0].get("value", "") if isinstance(cnt, list) and cnt else ""
+                    rss_summary = _strip_html_summary(summary_raw, max_len=300)
+                    if title and link:
+                        items.append({"title": title, "link": link, "pub": pub, "source": source, "rss_summary": rss_summary})
+                if items:
+                    return (items, "")
+            except Exception as e:
+                last_err = f"feedparse:{type(e).__name__}:{str(e)[:100]}"
+                continue
+
+        # fallback: urllib + ElementTree
+        raw = None
+        try:
+            req = urllib.request.Request(url, headers=headers)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                raw = resp.read()
+        except Exception as e:
+            last_err = f"fetch:{type(e).__name__}:{str(e)[:150]}"
+            continue
+        if not raw or len(raw) < 100:
+            last_err = last_err or "empty_or_short_response"
+            continue
+        if not (raw.lstrip().startswith(b"<?xml") or raw.lstrip().startswith(b"<rss") or raw.lstrip().startswith(b"<feed")):
+            last_err = last_err or "not_xml_response"
+            continue
+        items = []
+        try:
+            root = ET.fromstring(raw)
+            for elem in root.iter():
+                tag = elem.tag if isinstance(elem.tag, str) else ""
+                t = tag.lower()
+                if not (t.endswith("item") or t.endswith("entry")):
+                    continue
+                title_el = elem.find("title") or elem.find("{http://www.w3.org/2005/Atom}title")
+                link_el = elem.find("link") or elem.find("{http://www.w3.org/2005/Atom}link")
+                pub_el = elem.find("pubDate") or elem.find("updated") or elem.find("{http://www.w3.org/2005/Atom}updated")
+                source_el = elem.find("source") or elem.find("{http://www.w3.org/2005/Atom}source")
+                title = (title_el.text or "").strip() if title_el is not None else ""
+                link = (getattr(link_el, "attrib", {}).get("href") or (link_el.text or "")).strip() if link_el is not None else ""
+                pub_raw = (pub_el.text or "").strip() if pub_el is not None and pub_el.text else ""
+                pub = _format_pub_kr(pub_raw)
+                source = ""
+                if source_el is not None:
+                    st_el = source_el.find("title") or source_el.find("{http://www.w3.org/2005/Atom}title")
+                    source = (st_el.text or "").strip() if st_el is not None and st_el.text else (source_el.text or "").strip()
+                desc_el = elem.find("description") or elem.find("summary") or elem.find("{http://www.w3.org/2005/Atom}summary") or elem.find("{http://www.w3.org/2005/Atom}content")
+                summary_raw = ""
+                if desc_el is not None:
+                    summary_raw = (desc_el.text or "").strip()
+                    if not summary_raw:
+                        summary_raw = "".join(desc_el.itertext()).strip()
+                rss_summary = _strip_html_summary(summary_raw, max_len=300)
+                if title and link:
+                    items.append({"title": title, "link": link, "pub": pub, "source": source, "rss_summary": rss_summary})
+            items = items[:10]
+            if items:
+                return (items, "")
+        except Exception as e:
+            last_err = f"parse:{type(e).__name__}:{str(e)[:100]}"
+            continue
+    return ([], last_err or "no_items")
+
+
+def _fetch_market_news(region: str, _cache_buster: str = "") -> tuple:
+    """RSS 기사 수집. 캐시 없이 직접 호출."""
+    return _fetch_market_news_raw(region)
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 5)
+def _fetch_ticker_news(ticker: str, is_kr: bool, max_items: int = 5) -> tuple:
+    """구글 뉴스에서 특정 종목 관련 최신 뉴스 최대 5개 수집. (items, error_msg) 반환."""
+    if not ticker or not str(ticker).strip():
+        return ([], "no_ticker")
+    ticker = str(ticker).strip().upper()
+    if is_kr:
+        try:
+            from ticker_universe_kr import TICKER_TO_NAME
+            query = (TICKER_TO_NAME.get(ticker, ticker) or ticker) + " 주식"
+        except Exception:
+            query = ticker.replace(".KS", "").replace(".KQ", "") + " 주식"
+        q = urllib.parse.quote(query)
+        url = f"https://news.google.com/rss/search?q={q}&hl=ko&gl=KR&ceid=KR:ko"
+    else:
+        q = urllib.parse.quote(f"{ticker} stock")
+        url = f"https://news.google.com/rss/search?q={q}&hl=en-US&gl=US&ceid=US:en"
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; rv:91.0) Gecko/20100101 Firefox/91.0"}
+    if feedparser is not None:
+        try:
+            parsed = feedparser.parse(url, request_headers=headers)
+            entries = getattr(parsed, "entries", [])[:max_items]
+            items = []
+            for e in entries:
+                title = (e.get("title") or "").strip()
+                link = (e.get("link") or "").strip()
+                p = e.get("published_parsed") or e.get("updated_parsed")
+                pub_raw = e.get("published") or e.get("updated") or ""
+                pub = _format_pub_kr(pub_raw, p)
+                src = e.get("source")
+                source = ""
+                if src:
+                    try:
+                        source = (src.get("title") if hasattr(src, "get") else getattr(src, "title", "") or "").strip()
+                    except Exception:
+                        pass
+                summary_raw = e.get("summary") or e.get("description") or ""
+                if not summary_raw and e.get("content"):
+                    cnt = e.get("content")
+                    summary_raw = cnt[0].get("value", "") if isinstance(cnt, list) and cnt else ""
+                rss_summary = _strip_html_summary(summary_raw, max_len=300)
+                if title and link:
+                    items.append({"title": title, "link": link, "pub": pub, "source": source, "rss_summary": rss_summary})
+            return (items, "")
+        except Exception as e:
+            return ([], f"feedparse:{type(e).__name__}:{str(e)[:80]}")
+    return ([], "feedparser_unavailable")
+
+
+def _render_ticker_news(news: list, ticker: str):
+    """홈 뉴스와 동일한 형식으로 종목 관련 뉴스 렌더 (3줄 요약, 출처, 발행일 시분)."""
+    if not news:
+        st.caption("기사를 불러올 수 없습니다.")
+        return
+    st.markdown(f"**📰 {ticker} 관련 최신 뉴스 ({len(news)}개)**")
+    for i, n in enumerate(news, 1):
+        t = (n.get("title", "") or "").replace("\n", " ").strip()
+        with st.expander(f"{i}. {t}", expanded=False):
+            if n.get("summary"):
+                st.markdown(n["summary"].replace("\n", "\n\n"))
+            st.markdown(f"[**기사 보기**]({n['link']})")
+            caps = []
+            if n.get("source"):
+                caps.append(f"출처: {n['source']}")
+            if n.get("pub"):
+                caps.append(f"발행: {n['pub']}")
+            if caps:
+                st.caption(" · ".join(caps))
 
 def hard_refresh():
     # 미국 최근 종가 기준 전 데이터 최신화 (세션 전체 clear 없이 캐시/스냅/트래커만 정리)
@@ -609,6 +989,112 @@ def fetch_price(
 
 TRACKER_CSV = os.path.join(BASE_DIR, "top_pick_buy_tracker.csv")
 
+# 한국 증시 스캐너용 경로
+POSITIONS_KR_PATH = os.path.join(BASE_DIR, "positions_kr.csv")
+PORTFOLIO_CASH_KR_PATH = os.path.join(BASE_DIR, "portfolio_cash_kr.txt")
+TRACKER_KR_CSV = os.path.join(BASE_DIR, "top_pick_buy_tracker_kr.csv")
+SNAPSHOT_KR_PATTERN = os.path.join(BASE_DIR, "snapshots", "kr_scan_snapshot_*.json")
+
+try:
+    from ticker_universe_kr import TICKER_TO_NAME, NAME_TO_TICKER
+except ImportError:
+    TICKER_TO_NAME = {}
+    NAME_TO_TICKER = {}
+
+
+def _get_recent_kr_trading_date() -> str:
+    """최근 한국 거래일 YYYYMMDD (주말이면 금요일 등 이전 거래일)."""
+    from datetime import date, timedelta
+    d = date.today()
+    for _ in range(7):
+        if d.weekday() < 5:
+            return d.isoformat().replace("-", "")
+        d -= timedelta(days=1)
+    return date.today().isoformat().replace("-", "")
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 60 * 6)
+def _get_kr_name_to_ticker_full() -> dict:
+    """pykrx 또는 FinanceDataReader로 전체 시장 종목명→티커 매핑. 유니버스 외 종목 검색용."""
+    out = {}
+    # 1) pykrx 시도 (거래일 필요)
+    try:
+        from pykrx import stock
+        dt = _get_recent_kr_trading_date()
+        for market, suffix in [("KOSPI", ".KS"), ("KOSDAQ", ".KQ")]:
+            try:
+                tickers = stock.get_market_ticker_list(dt, market=market) or []
+                for t in tickers:
+                    try:
+                        name = stock.get_market_ticker_name(t)
+                        if name:
+                            out[name] = str(t).zfill(6) + suffix
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # 2) pykrx 비었으면 FinanceDataReader fallback
+    if not out:
+        try:
+            import FinanceDataReader as fdr
+            for market, suffix in [("KOSPI", ".KS"), ("KOSDAQ", ".KQ")]:
+                try:
+                    df = fdr.StockListing(market)
+                    if df is not None and not df.empty:
+                        code_col = "Code" if "Code" in df.columns else "Symbol"
+                        name_col = "Name" if "Name" in df.columns else "종목명"
+                        if code_col in df.columns and name_col in df.columns:
+                            for _, row in df.iterrows():
+                                code = str(row.get(code_col, "")).zfill(6)
+                                name = row.get(name_col)
+                                if code and name and str(name).strip():
+                                    out[str(name).strip()] = code + suffix
+                except Exception:
+                    pass
+        except Exception:
+            pass
+    return out
+
+
+def _resolve_kr_name_or_ticker(user_input: str) -> str:
+    """종목명 또는 티커 입력 → 티커 반환. 유니버스 외 종목도 pykrx로 조회."""
+    s = (user_input or "").strip()
+    if not s:
+        return ""
+    # 이미 티커 형식(.KS/.KQ)이면 그대로
+    if ".KS" in s.upper() or ".KQ" in s.upper():
+        return s.upper().strip()
+    # 1) 유니버스에서 종목명 → 티커
+    if s in NAME_TO_TICKER:
+        return NAME_TO_TICKER[s]
+    for name, ticker in NAME_TO_TICKER.items():
+        if name.upper() == s.upper():
+            return ticker
+    # 2) pykrx 전체 시장에서 종목명 → 티커 (유니버스 외 종목)
+    full_map = _get_kr_name_to_ticker_full()
+    if s in full_map:
+        return full_map[s]
+    for name, ticker in full_map.items():
+        if name and name.upper() == s.upper():
+            return ticker
+    # 3) 매칭 없으면 입력값 그대로 (yfinance가 처리 시도)
+    return s.upper().strip()
+
+
+def _fmt_currency(val: float, market: str = "us") -> str:
+    """금액 포맷: us=$, kr=₩"""
+    if val is None or (isinstance(val, float) and not np.isfinite(val)):
+        return "—"
+    try:
+        v = float(val)
+        if market == "kr":
+            return f"₩{v:,.0f}"
+        return f"${v:,.0f}"
+    except (TypeError, ValueError):
+        return "—"
+
 def _load_snapshot(path: str) -> dict:
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
@@ -630,6 +1116,7 @@ def get_latest_snapshot(pattern: Optional[str] = None) -> Optional[str]:
 
 
 
+@st.cache_data(show_spinner=False, ttl=300)
 def load_scan_snapshot(path: str) -> dict:
     snap = _load_snapshot(path)
 
@@ -669,12 +1156,191 @@ def _get_usdkrw_df(lookback_days: int = 240):
     return None
 
 
+def _extract_raw(val):
+    """API 응답이 {raw: x, fmt: y} 형태일 때 raw 추출."""
+    if val is None:
+        return None
+    if isinstance(val, dict) and "raw" in val:
+        return val["raw"]
+    try:
+        return float(val) if np.isfinite(float(val)) else None
+    except (TypeError, ValueError):
+        return None
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 15)  # 15분 캐시
+def _fetch_trending_us_tickers(count: int = 20) -> pd.DataFrame:
+    """Yahoo Finance Most Actives(오늘 가장 많이 검색/거래된 미국 증시 티커) 조회."""
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    url = (
+        "https://query2.finance.yahoo.com/v1/finance/screener/predefined/saved"
+        "?formatted=true&lang=en-US&region=US&scrIds=most_actives&count=%d&corsDomain=finance.yahoo.com"
+    ) % count
+
+    for fetcher in [_fetch_via_requests, _fetch_via_urllib]:
+        try:
+            data = fetcher(url, headers)
+            if not data:
+                continue
+            quotes = data.get("finance", {}).get("result") or []
+            if not quotes:
+                continue
+            quotes = (quotes[0] or {}).get("quotes") or []
+            if not quotes:
+                continue
+            rows = []
+            for i, q in enumerate(quotes[:count], 1):
+                sym = q.get("symbol", "")
+                name = q.get("shortName") or q.get("displayName") or q.get("longName") or sym
+                price = _extract_raw(q.get("regularMarketPrice"))
+                chg = _extract_raw(q.get("regularMarketChangePercent"))
+                vol = _extract_raw(q.get("regularMarketVolume"))
+                if isinstance(vol, float):
+                    vol = int(vol)
+                rows.append({
+                    "순위": i,
+                    "Ticker": sym,
+                    "종목명": (str(name)[:20] + "…") if len(str(name)) > 20 else str(name),
+                    "현재가": price,
+                    "등락률(%)": chg,
+                    "거래량": vol,
+                })
+            return pd.DataFrame(rows)
+        except Exception:
+            continue
+    return _fallback_trending_tickers(count)
+
+
+def _fetch_via_requests(url: str, headers: dict):
+    try:
+        import requests
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        return r.json()
+    except Exception:
+        return None
+
+
+def _fetch_via_urllib(url: str, headers: dict):
+    try:
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read().decode())
+    except Exception:
+        return None
+
+
+def _fallback_trending_tickers(count: int) -> pd.DataFrame:
+    """API 실패 시 yfinance로 인기 티커 조회."""
+    default_tickers = [
+        "AAPL", "MSFT", "NVDA", "GOOGL", "AMZN", "META", "TSLA", "BRK-B", "JPM", "V",
+        "WMT", "UNH", "JNJ", "PG", "XOM", "HD", "MA", "CVX", "ABBV", "MRK",
+    ][:count]
+    rows = []
+    for i, sym in enumerate(default_tickers, 1):
+        try:
+            t = yf.Ticker(sym)
+            info = t.info or {}
+            price = info.get("regularMarketPrice") or info.get("currentPrice")
+            chg = info.get("regularMarketChangePercent")
+            name = info.get("shortName") or info.get("longName") or sym
+            rows.append({
+                "순위": i,
+                "Ticker": sym,
+                "종목명": (str(name)[:20] + "…") if len(str(name)) > 20 else str(name),
+                "현재가": float(price) if price is not None and np.isfinite(float(price)) else None,
+                "등락률(%)": float(chg) if chg is not None and np.isfinite(float(chg)) else None,
+                "거래량": None,
+            })
+        except Exception:
+            rows.append({"순위": i, "Ticker": sym, "종목명": sym, "현재가": None, "등락률(%)": None, "거래량": None})
+    return pd.DataFrame(rows)
+
+
+# 한국 증시 트렌딩 티커 (yfinance 기반)
+KR_DEFAULT_TICKERS = [
+    "005930.KS", "000660.KS", "035420.KS", "051910.KS", "207940.KS",
+    "005380.KS", "000270.KS", "068270.KS", "006400.KS", "035720.KS",  # 000270=기아
+    "105560.KS", "003670.KS", "032830.KS", "017670.KS", "000810.KS",
+    "247540.KS", "086520.KS", "034730.KS", "066570.KS", "009150.KS",
+]
+
+
+@st.cache_data(show_spinner=False, ttl=60 * 15)
+def _fetch_trending_kr_tickers(count: int = 20) -> pd.DataFrame:
+    """한국 증시 트렌딩 티커 조회."""
+    rows = []
+    for i, sym in enumerate(KR_DEFAULT_TICKERS[:count], 1):
+        try:
+            t = yf.Ticker(sym)
+            info = t.info or {}
+            price = info.get("regularMarketPrice") or info.get("currentPrice")
+            chg = info.get("regularMarketChangePercent")
+            name = info.get("shortName") or info.get("longName") or sym
+            rows.append({
+                "순위": i,
+                "Ticker": sym,
+                "종목명": (str(name)[:20] + "…") if len(str(name)) > 20 else str(name),
+                "현재가": float(price) if price is not None and np.isfinite(float(price)) else None,
+                "등락률(%)": float(chg) if chg is not None and np.isfinite(float(chg)) else None,
+                "거래량": None,
+            })
+        except Exception:
+            rows.append({"순위": i, "Ticker": sym, "종목명": sym, "현재가": None, "등락률(%)": None, "거래량": None})
+    return pd.DataFrame(rows)
+
+
 def add_mas(df: pd.DataFrame, windows=(10, 20, 50)):
     out = df.copy()
     c = out["Close"]
     for w in windows:
         out[f"SMA{w}"] = c.rolling(w).mean()
     return out
+
+
+def _build_rangebreaks_kr(d: pd.DataFrame, is_kr: bool) -> list:
+    """주말 + (한국증시 시) 휴장일 rangebreaks"""
+    out = [dict(bounds=["sat", "mon"])]
+    if is_kr and d is not None and not d.empty:
+        kr_holidays = _get_kr_holidays_for_range(d.index.min(), d.index.max())
+        if kr_holidays:
+            out.append(dict(values=kr_holidays))
+    return out
+
+
+def _get_kr_holidays_for_range(start, end) -> List[str]:
+    """한국거래소 휴장일 → Plotly rangebreaks values용 (YYYY-MM-DD 리스트)"""
+    fixed = []
+    try:
+        t_start = pd.Timestamp(start).normalize()
+        t_end = pd.Timestamp(end).normalize()
+        for y in range(max(2020, t_start.year), min(2030, t_end.year + 1)):
+            fixed.extend([
+                f"{y}-01-01", f"{y}-03-01", f"{y}-05-05", f"{y}-06-06",
+                f"{y}-08-15", f"{y}-10-03", f"{y}-10-09", f"{y}-12-25",
+            ])
+            if y == 2024:
+                fixed.extend(["2024-02-09", "2024-02-10", "2024-02-11", "2024-02-12",
+                             "2024-09-16", "2024-09-17", "2024-09-18"])
+            elif y == 2025:
+                fixed.extend(["2025-01-28", "2025-01-29", "2025-01-30",
+                             "2025-10-05", "2025-10-06", "2025-10-07", "2025-10-08"])
+            elif y == 2026:
+                fixed.extend(["2026-02-16", "2026-02-17", "2026-02-18",
+                             "2026-09-24", "2026-09-25", "2026-09-26"])
+        # 데이터 범위 내 휴장일만 반환
+        out = []
+        for dstr in fixed:
+            try:
+                t = pd.Timestamp(dstr)
+                if t_start <= t <= t_end:
+                    out.append(dstr)
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
 
 def plot_candles(
     df: pd.DataFrame,
@@ -685,6 +1351,7 @@ def plot_candles(
     kind: str = "line",      # "line" | "candle"
     show_ma: bool = False,   # ✅ 기본 MA 숨김
     dark: bool = False,      # ✅ 다크 테마 (시장 차트 등)
+    is_kr: bool = False,     # ✅ 한국증시: 휴장일 rangebreaks 적용
 ):
     if df is None or df.empty:
         st.warning(f"{title}: 데이터 없음")
@@ -700,6 +1367,10 @@ def plot_candles(
         d0 = d0.sort_index()
     except Exception:
         pass
+
+    # OHLC NaN 행 제거 (캔들 갭 원인)
+    if all(c in d0.columns for c in ("Open", "High", "Low", "Close")):
+        d0 = d0.dropna(subset=["Open", "High", "Low", "Close"])
 
     # 거래일 기준 대략 22일/월
     n = max(22 * int(months), 22)
@@ -778,18 +1449,22 @@ def plot_candles(
     # candle일 때만 range slider 숨김(라인은 기본 숨김; 필요하면 True로 바꿔도 됨)
     if kind_eff == "candle":
         fig.update_layout(xaxis_rangeslider_visible=False)
+        fig.update_layout(xaxis=dict(rangebreaks=_build_rangebreaks_kr(d, is_kr)))
     else:
         fig.update_layout(xaxis_rangeslider_visible=False)
 
     # ✅ key 고정이 핵심 (차트 “밀림/자리바뀜” 방지)
     # 다크 테마 (시장 차트 등 HTML 패널과 통일)
     if dark:
+        xaxis_upd = dict(gridcolor="rgba(100,116,139,0.3)", zerolinecolor="rgba(100,116,139,0.3)")
+        if kind_eff == "candle" and hasattr(fig.layout, "xaxis") and getattr(fig.layout.xaxis, "rangebreaks", None):
+            xaxis_upd["rangebreaks"] = fig.layout.xaxis.rangebreaks
         fig.update_layout(
             paper_bgcolor="rgba(15,23,42,0.95)",
             plot_bgcolor="rgba(15,23,42,0.92)",
             font=dict(color="#e2e8f0", size=12),
             title_font=dict(color="#f1f5f9"),
-            xaxis=dict(gridcolor="rgba(100,116,139,0.3)", zerolinecolor="rgba(100,116,139,0.3)"),
+            xaxis=xaxis_upd,
             yaxis=dict(gridcolor="rgba(100,116,139,0.3)", zerolinecolor="rgba(100,116,139,0.3)"),
         )
         if kind_eff == "line" and len(fig.data) > 0:
@@ -807,6 +1482,7 @@ def plot_candles_with_signals(
     *,
     chart_key: str,
     dark: bool = False,
+    is_kr: bool = False,
 ):
     """최근 1년 캔들 + 매수(초록 삼각형)·매도(빨간 삼각형) 신호 마커. 매도 호버 시 매수 대비 수익률 표시."""
     if df is None or df.empty:
@@ -822,6 +1498,8 @@ def plot_candles_with_signals(
     if not all(c in d0.columns for c in ("Open", "High", "Low", "Close")):
         st.warning(f"{title}: OHLC 컬럼이 없어 캔들을 그릴 수 없습니다.")
         return
+    # OHLC NaN 행 제거 (캔들 갭 원인)
+    d0 = d0.dropna(subset=["Open", "High", "Low", "Close"])
 
     fig = go.Figure()
     fig.add_trace(go.Candlestick(
@@ -944,7 +1622,7 @@ def plot_candles_with_signals(
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(240,240,245,0.8)",
         xaxis=dict(
-            rangebreaks=[dict(bounds=["sat", "mon"])],
+            rangebreaks=_build_rangebreaks_kr(d0, is_kr),
             showgrid=True,
             gridwidth=1,
             gridcolor="rgba(200,200,210,0.5)",
@@ -959,12 +1637,14 @@ def plot_candles_with_signals(
     )
     # 다크 테마 (티커 검색 차트를 HTML 패널 스타일과 통일)
     if dark:
+        xaxis_dark = dict(gridcolor="rgba(100,116,139,0.3)", zerolinecolor="rgba(100,116,139,0.3)")
+        xaxis_dark["rangebreaks"] = _build_rangebreaks_kr(d0, is_kr)
         fig.update_layout(
             paper_bgcolor="rgba(15,23,42,0.95)",
             plot_bgcolor="rgba(15,23,42,0.92)",
             font=dict(color="#e2e8f0", size=12),
             title_font=dict(color="#f1f5f9"),
-            xaxis=dict(gridcolor="rgba(100,116,139,0.3)", zerolinecolor="rgba(100,116,139,0.3)"),
+            xaxis=xaxis_dark,
             yaxis=dict(gridcolor="rgba(100,116,139,0.3)", zerolinecolor="rgba(100,116,139,0.3)"),
         )
         # 캔들 색상 다크 대비
@@ -978,6 +1658,7 @@ def plot_candles_with_signals(
     st.plotly_chart(fig, use_container_width=True, key=chart_key)
 
 
+@st.cache_data(show_spinner=False, ttl=60)
 def load_tracker(path=TRACKER_CSV):
     if not os.path.exists(path):
         return pd.DataFrame(columns=[
@@ -1054,14 +1735,18 @@ def seed_tracker_from_recent_snapshots(
     *,
     max_files: int = 60,
     max_seed: int = 3,
+    snapshot_pattern: Optional[str] = None,
+    tracker_path: Optional[str] = None,
 ) -> list[str]:
     """
     ✅ CSV가 없거나/비었을 때:
     - 최근 스냅샷들에서 BUY_BREAKOUT/BUY_PULLBACK 티커를 모아서
       Promoted 제외 후, 최대 max_seed개를 tracker(OPEN)로 '재시드'한다.
     - 반환: 실제로 seed된 티커 리스트
+    - snapshot_pattern/tracker_path: KR 시장용 (None이면 US 기본값)
     """
-    files = sorted(glob.glob(SNAPSHOT_PATTERN))[-max_files:]
+    pat = snapshot_pattern or SNAPSHOT_PATTERN
+    files = sorted(glob.glob(pat))[-max_files:]
     if not files:
         return []
 
@@ -1122,7 +1807,7 @@ def seed_tracker_from_recent_snapshots(
         return []
 
     # 2) tracker 로드(없으면 빈 DF)
-    tr = load_tracker()
+    tr = load_tracker(tracker_path) if tracker_path else load_tracker()
     if tr is None or tr.empty:
         tr = pd.DataFrame(columns=[
             "Ticker","SignalDate","EntryDate","EntryPrice",
@@ -1195,7 +1880,10 @@ def seed_tracker_from_recent_snapshots(
 
         seeded.append(t)
 
-    save_tracker(tr)
+    if tracker_path:
+        save_tracker(tr, tracker_path)
+    else:
+        save_tracker(tr)
     return seeded
 
 def _entry_price_on_signal_date(ticker: str):
@@ -1292,7 +1980,7 @@ def _recent_top3_buy_universe(max_files: int = 30) -> set[str]:
         return set()
 
 
-def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 15, run_date=None):
+def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 15, run_date=None, tracker_path: Optional[str] = None, snapshot_pattern: Optional[str] = None):
     """
     ✅ 안정 버전(요청사항 반영)
     - TOP PICK3 중 BUY(BUY_BREAKOUT/BUY_PULLBACK)만 tracker에 신규 편입
@@ -1301,8 +1989,9 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
     - 기존에 추적 중이던 정상 BUY 종목(과거 OPEN)은 절대 '유니버스 밖' 이유로 삭제하지 않음  ← 핵심
     - 신규 편입 종목은 당일/첫날엔 exit 판정 금지(바로 CLOSED 방지)
     - CLOSED는 15거래일 도달 시에만 적용(조기 청산/손절/익절 시그널 무시)
+    - tracker_path/snapshot_pattern: KR 시장용 (None이면 US 기본값)
     """
-    tr = load_tracker()
+    tr = load_tracker(tracker_path) if tracker_path else load_tracker()
 
     # 기본 컬럼 보강(구버전 CSV/빈 DF 방어)
     if tr is None or tr.empty:
@@ -1324,9 +2013,10 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
     # (A) OPEN 포지션 정리(prune) - "PROMOTED만" 제거
     #    (유니버스 밖이라고 지우면 예전 정상 BUY가 다 날아가서 금지)
     # -------------------------
+    _snap_pat = snapshot_pattern or SNAPSHOT_PATTERN
     def _recent_promoted_tickers(max_files: int = 60) -> set[str]:
         promo = set()
-        files = sorted(glob.glob(SNAPSHOT_PATTERN))[-max_files:]
+        files = sorted(glob.glob(_snap_pat))[-max_files:]
         for p in files:
             try:
                 snap = load_scan_snapshot(p)
@@ -1441,7 +2131,10 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
     # (C) OPEN 업데이트 & 종료 판단
     # -------------------------
     if tr.empty:
-        save_tracker(tr)
+        if tracker_path:
+            save_tracker(tr, tracker_path)
+        else:
+            save_tracker(tr)
         return tr, pd.DataFrame()
 
     # 타입 안정화
@@ -1522,7 +2215,10 @@ def update_tracker_with_today(top3_buy_tickers: List[str], max_hold_days: int = 
             tr.loc[idx, "ExitReason"] = exit_reason
             closed_today.append(tr.loc[idx].to_dict())
 
-    save_tracker(tr)
+    if tracker_path:
+        save_tracker(tr, tracker_path)
+    else:
+        save_tracker(tr)
     closed_df = pd.DataFrame(closed_today) if closed_today else pd.DataFrame()
     return tr, closed_df
 
@@ -1994,9 +2690,13 @@ def load_scan_snapshot_only(snapshot_path: Optional[str] = None) -> dict:
 
     snap = load_scan_snapshot(snapshot_path)
     snap["snapshot_path"] = snapshot_path
-    # ✅ run_date가 없으면 파일명에서 만든다
+    # ✅ run_date가 없으면 파일명에서 만든다 (US: scan_snapshot_, KR: kr_scan_snapshot_)
     if "run_date" not in snap or not snap.get("run_date"):
-        snap["run_date"] = os.path.basename(snapshot_path).replace("scan_snapshot_", "").replace(".json", "")
+        base = os.path.basename(snapshot_path).replace(".json", "")
+        if base.startswith("kr_scan_snapshot_"):
+            snap["run_date"] = base.replace("kr_scan_snapshot_", "")
+        else:
+            snap["run_date"] = base.replace("scan_snapshot_", "")
     return snap
 
 
@@ -2055,7 +2755,7 @@ def analyze_ticker_reco(ticker: str, shares: float = 1.0, avg_price: Optional[fl
     add_ok = False
     plan = None
     if str(entry).startswith("BUY_"):
-        plan = sc.calc_trade_plan(df2, entry)
+        plan = sc.calc_trade_plan(df2, entry, ticker=ticker)
         if plan is not None and plan.get("RR", 0) >= cfg.MIN_RR and plan.get("Shares", 0) > 0:
             add_ok = True
         else:
@@ -2119,6 +2819,7 @@ def analyze_ticker_reco(ticker: str, shares: float = 1.0, avg_price: Optional[fl
 
 
 
+@st.cache_data(show_spinner=False, ttl=60)
 def load_positions(path="positions.csv"):
     if not st.session_state.get("positions_df_loaded"):
         pass
@@ -2135,9 +2836,10 @@ def load_positions(path="positions.csv"):
     return df
 
 
-def load_portfolio_cash() -> float:
-    """포트폴리오 현금 잔고 로드 (portfolio_cash.txt)"""
-    p = os.path.join(BASE_DIR, "portfolio_cash.txt")
+@st.cache_data(show_spinner=False, ttl=60)
+def load_portfolio_cash(path: Optional[str] = None) -> float:
+    """포트폴리오 현금 잔고 로드. path 없으면 portfolio_cash.txt"""
+    p = path or os.path.join(BASE_DIR, "portfolio_cash.txt")
     if not os.path.exists(p):
         return 0.0
     try:
@@ -2146,8 +2848,8 @@ def load_portfolio_cash() -> float:
     except Exception:
         return 0.0
 
-def save_portfolio_cash(value: float):
-    p = os.path.join(BASE_DIR, "portfolio_cash.txt")
+def save_portfolio_cash(value: float, path: Optional[str] = None):
+    p = path or os.path.join(BASE_DIR, "portfolio_cash.txt")
     with open(p, "w", encoding="utf-8") as f:
         f.write(str(value))
 
@@ -2252,6 +2954,36 @@ def run_scanner_subprocess(timeout_sec: int = 900):
     except Exception as e:
         return False, f"EXCEPTION: {e}", "", ""
 
+
+def run_scanner_kr_subprocess(timeout_sec: int = 900):
+    """한국 증시 스캐너(scanner_kr.py) 실행"""
+    scanner_path = os.path.join(BASE_DIR, "scanner_kr.py")
+    if not os.path.exists(scanner_path):
+        return False, f"scanner_kr.py not found: {scanner_path}", "", ""
+
+    env = os.environ.copy()
+    env["PYTHONUNBUFFERED"] = "1"
+
+    try:
+        r = subprocess.run(
+            [sys.executable, "-u", scanner_path, "--mode", "scan"],
+            cwd=BASE_DIR,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            env=env,
+            timeout=timeout_sec,
+        )
+        ok = (r.returncode == 0)
+        return ok, f"returncode={r.returncode}", (r.stdout or ""), (r.stderr or "")
+    except subprocess.TimeoutExpired as e:
+        out = getattr(e, "stdout", "") or ""
+        err = getattr(e, "stderr", "") or ""
+        return False, f"TIMEOUT: {timeout_sec}s", out, err
+    except Exception as e:
+        return False, f"EXCEPTION: {e}", "", ""
+
+
 def invalidate_snapshot_cache():
     # Streamlit 쪽 snapshot/트래커/캐시 무효화
     st.session_state.pop("scan_snap", None)
@@ -2317,7 +3049,66 @@ if _bg_data_uri:
         unsafe_allow_html=True,
     )
 
+# URL 쿼리 파라미터로 홈 이동 (뒤로가기 링크용)
+if hasattr(st, "query_params"):
+    goto = st.query_params.get("goto")
+    if goto == "home":
+        st.session_state["nav_page_radio"] = "🏠 홈"
+        st.query_params.clear()
+    elif goto == "us_scanner":
+        st.session_state["nav_page_radio"] = "US Stock Scanner"
+        st.query_params.clear()
+    elif goto == "kr_scanner":
+        st.session_state["nav_page_radio"] = "KR Stock Scanner"
+        st.query_params.clear()
+
+# 버튼 클릭 시 페이지 전환 (radio key 수정 전에 처리)
+if st.session_state.get("_goto_us_scanner"):
+    st.session_state["nav_page_radio"] = "US Stock Scanner"
+    del st.session_state["_goto_us_scanner"]
+if st.session_state.get("_goto_home"):
+    st.session_state["nav_page_radio"] = "🏠 홈"
+    del st.session_state["_goto_home"]
+if st.session_state.get("_goto_kr_scanner"):
+    st.session_state["nav_page_radio"] = "KR Stock Scanner"
+    del st.session_state["_goto_kr_scanner"]
+
 with st.sidebar:
+    st.markdown("### 🧭 페이지")
+    _nav_current = st.session_state.get("nav_page_radio", "🏠 홈")
+    if _nav_current == "🇺🇸 미국 증시 스캐너":
+        _nav_current = "US Stock Scanner"
+    elif _nav_current == "🇰🇷 한국 증시 스캐너":
+        _nav_current = "KR Stock Scanner"
+    _nav_css = """
+    <style>
+    .nav-link { position:relative; display:flex; align-items:center; gap:8px; padding:8px 12px; margin:4px 0; border-radius:8px; text-decoration:none; color:#e2e8f0; font-size:0.95rem; transition:all 0.2s; overflow:hidden; }
+    .nav-link:hover { background:rgba(59,130,246,0.2); }
+    .nav-link.active { background:rgba(251,191,36,0.2); border:1px solid rgba(251,191,36,0.5); }
+    .nav-link img.nav-flag { width:24px; height:16px; object-fit:contain; }
+    .nav-link .flag-bg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; opacity:0; transition:opacity 0.25s ease; pointer-events:none; }
+    .nav-link .flag-bg img { width:56px; height:38px; object-fit:contain; }
+    .nav-link:hover .flag-bg { opacity:0.5; }
+    .nav-link.us, .nav-link.kr { justify-content:flex-start; padding-left:36px; }
+    .nav-link.us:hover { background:linear-gradient(135deg,rgba(60,59,110,0.35),rgba(178,34,52,0.18)); }
+    .nav-link.kr:hover { background:linear-gradient(135deg,rgba(205,46,58,0.3),rgba(0,71,160,0.3)); }
+    .nav-link.home { justify-content:center; }
+    .nav-link.home .home-emoji-bg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center; font-size:2rem; opacity:0; transition:opacity 0.25s ease; pointer-events:none; }
+    .nav-link.home:hover .home-emoji-bg { opacity:0.6; }
+    </style>
+    """
+    _home_cls = "nav-link active home" if _nav_current == "🏠 홈" else "nav-link home"
+    _us_cls = "nav-link active us" if _nav_current == "US Stock Scanner" else "nav-link us"
+    _kr_cls = "nav-link active kr" if _nav_current == "KR Stock Scanner" else "nav-link kr"
+    st.markdown(_nav_css + f"""
+    <div style="display:flex;flex-direction:column;gap:2px;">
+    <a href="?goto=home" target="_self" class="{_home_cls}"><span class="home-emoji-bg">🏠</span>Home</a>
+    <a href="?goto=us_scanner" target="_self" class="{_us_cls}"><span class="flag-bg"><img src="https://flagcdn.com/w160/us.png" alt=""></span><img class="nav-flag" src="https://flagcdn.com/w24/us.png" alt=""> US Stock Scanner</a>
+    <a href="?goto=kr_scanner" target="_self" class="{_kr_cls}"><span class="flag-bg"><img src="https://flagcdn.com/w160/kr.png" alt=""></span><img class="nav-flag" src="https://flagcdn.com/w24/kr.png" alt=""> KR Stock Scanner</a>
+    </div>
+    """, unsafe_allow_html=True)
+    page = _nav_current
+    st.divider()
     st.markdown(f"### ⚙️ App Controls\n- Version: `{APP_VERSION}`")
 
     colx, coly = st.columns(2)
@@ -2331,6 +3122,934 @@ with st.sidebar:
             hard_refresh()
 
     st.divider()
+
+# =========================
+# 홈 vs 미국 증시 스캐너 분기
+# =========================
+if page == "🏠 홈":
+    st.markdown('<style>.main .block-container { padding-top: 0 !important; }</style>', unsafe_allow_html=True)
+    _home_logo_path = os.path.join(BASE_DIR, "assets", "home_logo.png")
+    if os.path.isfile(_home_logo_path):
+        try:
+            from PIL import Image
+            import io
+            import base64
+            img = Image.open(_home_logo_path).convert("RGBA")
+            arr = np.array(img)
+            thresh = 40
+            mask = (arr[:, :, 0] <= thresh) & (arr[:, :, 1] <= thresh) & (arr[:, :, 2] <= thresh)
+            arr[mask, 3] = 0
+            img_nobg = Image.fromarray(arr)
+            buf = io.BytesIO()
+            img_nobg.save(buf, format="PNG")
+            home_logo_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            st.markdown(
+                '<div style="position:relative;height:140px;margin-top:-16px;"><img src="data:image/png;base64,' + home_logo_b64 + '" style="width:360px;position:absolute;top:-40px;left:-20px;display:block;" alt="Stock Scanner Home" /></div>',
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            st.image(_home_logo_path, width=360)
+    else:
+        st.markdown("## 🏠 홈")
+    st.markdown("---")
+    col1, col2, col3 = st.columns([3, 1, 1])
+    with col1:
+        st.markdown("""
+        <style>
+        .home-nav-btn { position:relative; display:inline-block; width:100%; padding:12px 20px; font-size:1rem; font-weight:600; text-align:center;
+            border-radius:12px; border:1px solid rgba(100,116,139,0.5); cursor:pointer; text-decoration:none; color:#e2e8f0;
+            background:linear-gradient(135deg,rgba(30,58,95,0.9),rgba(49,46,129,0.9)); transition:all 0.3s ease;
+            box-shadow:0 2px 8px rgba(0,0,0,0.3); margin-bottom:8px; overflow:hidden; }
+        .home-nav-btn .flag-bg { position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
+            opacity:0; transition:opacity 0.3s ease; pointer-events:none; }
+        .home-nav-btn .flag-bg img { width:80px; height:54px; object-fit:contain; }
+        .home-nav-btn:hover { transform:scale(1.02); box-shadow:0 4px 16px rgba(59,130,246,0.4); }
+        .home-nav-btn:hover .flag-bg { opacity:0.45; }
+        .home-nav-btn.us:hover { background:linear-gradient(135deg,rgba(60,59,110,0.35),rgba(178,34,52,0.18)); }
+        .home-nav-btn.kr:hover { background:linear-gradient(135deg,rgba(205,46,58,0.3),rgba(0,71,160,0.3)); }
+        </style>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;justify-items:start;">
+        <a href="?goto=us_scanner" target="_self" class="home-nav-btn us"><span class="flag-bg"><img src="https://flagcdn.com/w160/us.png" alt="US"></span>US Stock Scanner로 이동</a>
+        <a href="?goto=kr_scanner" target="_self" class="home-nav-btn kr"><span class="flag-bg"><img src="https://flagcdn.com/w160/kr.png" alt="KR"></span>KR Stock Scanner로 이동</a>
+        </div>
+        """, unsafe_allow_html=True)
+    st.markdown("---")
+
+    # 미국 시장 차트: VOO / QQQ / 다우 지수
+    st.markdown(
+        "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
+        "box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);"
+        "margin:0.5rem 0;font-size:1.1rem;font-weight:700;'><img src='https://flagcdn.com/w40/us.png' style='height:1.1em;vertical-align:middle;'> 미국 시장 차트 (최근 3개월)</div>",
+        unsafe_allow_html=True,
+    )
+    h1_c1, h1_c2, h1_c3 = st.columns(3)
+    with h1_c1:
+        voo_df = fetch_price("VOO", 400, get_cache_buster())
+        plot_candles(voo_df, "S&P500 (3M Line)", chart_key="home_voo", months=3, kind="line", show_ma=False, dark=True)
+    with h1_c2:
+        qqq_df = fetch_price("QQQ", 400, get_cache_buster())
+        plot_candles(qqq_df, "NASDAQ 100 (3M Line)", chart_key="home_qqq", months=3, kind="line", show_ma=False, dark=True)
+    with h1_c3:
+        dow_df = fetch_price("^DJI", 400, get_cache_buster())
+        plot_candles(dow_df, "DOW JONES (3M Line)", chart_key="home_dow", months=3, kind="line", show_ma=False, dark=True)
+
+    # 한국 시장 차트: 코스피 / 코스닥 / 환율
+    st.markdown(
+        "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
+        "box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);"
+        "margin:0.5rem 0;font-size:1.1rem;font-weight:700;'><img src='https://flagcdn.com/w40/kr.png' style='height:1.1em;vertical-align:middle;'> 한국 시장 차트 (최근 3개월)</div>",
+        unsafe_allow_html=True,
+    )
+    h2_c1, h2_c2, h2_c3 = st.columns(3)
+    with h2_c1:
+        kospi_df = fetch_price("^KS11", 400, get_cache_buster())
+        plot_candles(kospi_df, "코스피 (3M Line)", chart_key="home_kospi", months=3, kind="line", show_ma=False, dark=True)
+    with h2_c2:
+        kosdaq_df = fetch_price("^KQ11", 400, get_cache_buster())
+        plot_candles(kosdaq_df, "코스닥 (3M Line)", chart_key="home_kosdaq", months=3, kind="line", show_ma=False, dark=True)
+    with h2_c3:
+        fx_df = _get_usdkrw_df(lookback_days=900)
+        plot_candles(fx_df, "USD/KRW (3M Line)", chart_key="home_usdkrw", months=3, kind="line", show_ma=False, dark=True)
+
+    # 미국/한국 증시 주요 기사 (각 기사별 접었다 펼 수 있음)
+    _news_ts = st.session_state.get("news_refresh_ts", "")
+    if st.button("📰 기사 새로고침", key="news_refresh_btn"):
+        st.session_state["news_refresh_ts"] = datetime.now().isoformat()
+        st.rerun()
+    us_news, us_err = _fetch_market_news("us", "")
+    kr_news, kr_err = _fetch_market_news("kr", "")
+
+    with st.spinner("기사 요약 불러오는 중…"):
+        _cb = st.session_state.get("news_refresh_ts", "")
+        us_news = _enrich_news_with_summaries(us_news, _cb)
+        kr_news = _enrich_news_with_summaries(kr_news, _cb)
+
+    st.markdown("**<img src='https://flagcdn.com/w40/us.png' style='height:1.1em;vertical-align:middle;'> 미국 증시 주요 기사**", unsafe_allow_html=True)
+    if not us_news:
+        st.caption("기사를 불러올 수 없습니다. 네트워크를 확인하거나 잠시 후 다시 시도해 주세요.")
+        if us_err:
+            with st.expander("오류 상세 (미국)", expanded=False):
+                st.code(us_err)
+    else:
+        for i, n in enumerate(us_news, 1):
+            t = (n.get("title", "") or "").replace("\n", " ").strip()
+            with st.expander(f"{i}. {t}", expanded=False):
+                if n.get("summary"):
+                    st.markdown(n["summary"].replace("\n", "\n\n"))
+                st.markdown(f"[**기사 보기**]({n['link']})")
+                caps = []
+                if n.get("source"):
+                    caps.append(f"출처: {n['source']}")
+                if n.get("pub"):
+                    caps.append(f"발행: {n['pub']}")
+                if caps:
+                    st.caption(" · ".join(caps))
+
+    st.markdown("**<img src='https://flagcdn.com/w40/kr.png' style='height:1.1em;vertical-align:middle;'> 한국 증시 주요 기사**", unsafe_allow_html=True)
+    if not kr_news:
+        st.caption("기사를 불러올 수 없습니다. 네트워크를 확인하거나 잠시 후 다시 시도해 주세요.")
+        if kr_err:
+            with st.expander("오류 상세 (한국)", expanded=False):
+                st.code(kr_err)
+    else:
+        for i, n in enumerate(kr_news, 1):
+            t = (n.get("title", "") or "").replace("\n", " ").strip()
+            with st.expander(f"{i}. {t}", expanded=False):
+                if n.get("summary"):
+                    st.markdown(n["summary"].replace("\n", "\n\n"))
+                st.markdown(f"[**기사 보기**]({n['link']})")
+                caps = []
+                if n.get("source"):
+                    caps.append(f"출처: {n['source']}")
+                if n.get("pub"):
+                    caps.append(f"발행: {n['pub']}")
+                if caps:
+                    st.caption(" · ".join(caps))
+
+    st.markdown("---")
+    st.stop()
+
+if page == "KR Stock Scanner":
+    # 한국 증시 스캐너: 뒤로가기 + 탭 구조 (US와 동일, 통화는 KRW)
+    st.markdown(
+        '<form action="" method="get" target="_self" style="position:fixed;bottom:24px;right:24px;z-index:9999;">'
+        '<input type="hidden" name="goto" value="home" />'
+        '<button type="submit" style="padding:10px 16px;background:rgba(30,41,59,0.95);color:#e2e8f0;border-radius:8px;'
+        'font-size:0.9rem;border:1px solid rgba(100,116,139,0.4);cursor:pointer;'
+        'box-shadow:0 2px 8px rgba(0,0,0,0.3);">← 뒤로가기</button></form>',
+        unsafe_allow_html=True,
+    )
+    # 로고: 크기 축소, 탭과 겹치지 않도록 위쪽 배치
+    _kr_logo_path = os.path.join(BASE_DIR, "assets", "kr_stock_scanner_logo.png")
+    _kr_logo_width = int(240)
+    if os.path.isfile(_kr_logo_path):
+        try:
+            from PIL import Image
+            import io
+            import base64
+            img = Image.open(_kr_logo_path).convert("RGBA")
+            arr = np.array(img)
+            thresh = 40
+            mask = (arr[:, :, 0] <= thresh) & (arr[:, :, 1] <= thresh) & (arr[:, :, 2] <= thresh)
+            arr[mask, 3] = 0
+            img_nobg = Image.fromarray(arr)
+            buf = io.BytesIO()
+            img_nobg.save(buf, format="PNG")
+            kr_logo_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            st.markdown(
+                '<div style="height:100px;position:relative;">'
+                '<img src="data:image/png;base64,' + kr_logo_b64 + '" style="width:' + str(_kr_logo_width) + 'px;position:absolute;top:-60px;left:-35px;display:block;" alt="KR Stock Scanner" />'
+                '</div>',
+                unsafe_allow_html=True,
+            )
+        except Exception:
+            _c1, _c2 = st.columns([1, 10])
+            with _c1:
+                st.image(_kr_logo_path, width=_kr_logo_width)
+    else:
+        st.title("🇰🇷 한국 증시 스캐너")
+    kr_tab1, kr_tab2, kr_tab3 = st.tabs(["🔎 종목검색", "📁 포트폴리오 관리", "🚀 스캔 실행"])
+
+    with kr_tab1:
+        st.subheader("종목검색")
+        if "kr_ticker_input" not in st.session_state or st.session_state.get("kr_ticker_input") == "005930.KS":
+            st.session_state["kr_ticker_input"] = "삼성전자"
+        kr_ticker = st.text_input("종목명 또는 종목코드", key="kr_ticker_input",
+            placeholder="예: 카카오, 삼성전자 또는 035720.KQ",
+            help="종목명(카카오, 삼성전자 등) 또는 종목코드(005930.KS, 035720.KQ) 입력")
+        kr_ticker = (kr_ticker or "").strip()
+
+        btn_col1, btn_col2 = st.columns([1, 1])
+        with btn_col1:
+            if kr_ticker and st.button("분석하기", key="kr_analyze_btn", type="primary"):
+                kr_resolved = _resolve_kr_name_or_ticker(kr_ticker)
+                if not kr_resolved:
+                    st.error("종목명 또는 종목코드를 확인하세요.")
+                else:
+                    res = analyze_ticker_reco(kr_resolved, shares=1.0, avg_price=None)
+                    if "error" in res:
+                        st.error(res["error"])
+                    st.session_state["kr_ticker_result"] = res
+                    st.session_state["kr_show_ticker_result"] = True
+        with btn_col2:
+            if st.session_state.get("kr_show_ticker_result") and st.session_state.get("kr_ticker_result"):
+                if st.button("닫기", key="kr_close_ticker_result", type="secondary"):
+                    st.session_state["kr_show_ticker_result"] = False
+                    st.session_state.pop("kr_ticker_result", None)
+
+        # 검색 결과를 트렌딩 20개 위에 표시
+        if st.session_state.get("kr_show_ticker_result") and st.session_state.get("kr_ticker_result"):
+            res = st.session_state["kr_ticker_result"]
+            if "error" in res:
+                st.stop()
+            st.success(f"[{res['ticker']}] 추천: {res['reco']}")
+            st.write(res["why"])
+            tp = res.get("tp", {}) or {}
+            risk = res.get("risk", {}) or {}
+            t1, t2, t3 = tp.get("t1"), tp.get("t2"), tp.get("t3")
+            close = tp.get("close")
+            stop_2nd_pct = float(getattr(cfg, "SELL_2ND_CUT_PCT", 5.0))
+            loss_cut_pct = float(getattr(cfg, "SELL_LOSS_CUT_PCT", 10.0))
+            stop1 = risk.get("Stop1Price")
+            stop2 = risk.get("Stop2Price")
+            stop3 = risk.get("Stop3Price")
+            suggested_pct = risk.get("SuggestedSellPct")
+            suggested_reason = risk.get("SuggestedSellReason") or ""
+            st.caption("기준가: **현재가** (티커만 입력 시)")
+            st.markdown("**1·2·3 목표가(익절)**")
+            st.markdown(f"- 현재가: {_fmt_currency(close, 'kr')} → 1차: {_fmt_currency(t1, 'kr')} · 2차: {_fmt_currency(t2, 'kr')} · 3차: {_fmt_currency(t3, 'kr')}")
+            st.markdown("**1·2·3 손절가** (1차 ≥ 2차 ≥ 3차)")
+            st.markdown(f"- 1차(트레일 이탈): {_fmt_currency(stop1, 'kr')} · 2차(중간 -{stop_2nd_pct:.0f}%): {_fmt_currency(stop2, 'kr')} · 3차(전액 -{loss_cut_pct:.0f}%): {_fmt_currency(stop3, 'kr')}")
+            if (suggested_pct is not None and suggested_pct > 0) or (suggested_reason and str(suggested_reason).strip()):
+                pct_display = (suggested_pct * 100) if suggested_pct is not None and suggested_pct <= 1.0 else suggested_pct
+                st.markdown(f"- **권장 매도 비율(스케일아웃)**: {pct_display:.0f}% — {suggested_reason} (보유 수량 중 이 비율만큼 매도 권장)")
+            buy_dates = res.get("buy_signal_dates") or []
+            sell_dates = res.get("sell_signal_dates") or []
+            buy_reasons = res.get("buy_reasons") or []
+            sell_reasons = res.get("sell_reasons") or []
+            last_buy_str = pd.Timestamp(buy_dates[-1]).strftime("%Y-%m-%d") if buy_dates else "—"
+            last_sell_str = pd.Timestamp(sell_dates[-1]).strftime("%Y-%m-%d") if sell_dates else "—"
+            last_buy_reason = (buy_reasons[-1] if buy_reasons else "") or "—"
+            last_sell_reason = (sell_reasons[-1] if sell_reasons else "") or "—"
+            st.markdown(f"**최근 매수 신호:** {last_buy_str} — {last_buy_reason}")
+            st.markdown(f"**최근 매도 신호:** {last_sell_str} — {last_sell_reason}")
+            with st.expander("종목 상태 상세 (Ticker State)"):
+                _p = lambda s: f"<p style='color:#f1f5f9;font-size:1.05rem;margin:0.22rem 0;'>{s}</p>"
+                df_tail = res.get("df_tail")
+                if df_tail is not None and not df_tail.empty and len(df_tail) >= 2:
+                    last = df_tail.iloc[-1]
+                    prev = df_tail.iloc[-2]
+                    close_val = float(last.get("Close", 0)) if "Close" in last else 0
+                    open_val = float(last.get("Open", 0)) if "Open" in last else 0
+                    high_val = float(last.get("High", 0)) if "High" in last else 0
+                    low_val = float(last.get("Low", 0)) if "Low" in last else 0
+                    prev_close = float(prev.get("Close", 0)) if "Close" in prev else close_val
+                    col_t1, col_t2, col_t3 = st.columns(3)
+                    def _add_item(col, label, val_str, badge):
+                        col.markdown(_p(f"{label}: {val_str} {badge}"), unsafe_allow_html=True)
+                    with col_t1:
+                        macd_h = last.get("MACD_H")
+                        if macd_h is not None and np.isfinite(float(macd_h)):
+                            macd_h_f = float(macd_h)
+                            _add_item(col_t1, "MACD", "상승" if macd_h_f > 0 else "하락", "✅ good" if macd_h_f > 0 else "❌ bad")
+                        rsi_val = last.get("RSI14")
+                        if rsi_val is not None and np.isfinite(float(rsi_val)):
+                            rsi_f = float(rsi_val)
+                            if rsi_f < 30: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (과매도)", "✅ good")
+                            elif rsi_f > 70: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (과매수)", "❌ bad")
+                            else: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (적정)", "➖ normal")
+                        atr14 = last.get("ATR14")
+                        if atr14 is not None and close_val > 0 and np.isfinite(float(atr14)):
+                            atr_pct = float(atr14) / close_val * 100
+                            if atr_pct < 2: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (낮음)", "❌ bad")
+                            elif atr_pct > 6: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (높음)", "❌ bad")
+                            else: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (적정)", "➖ normal")
+                        adx_val = last.get("ADX14")
+                        if adx_val is not None and np.isfinite(float(adx_val)):
+                            adx_f = float(adx_val)
+                            if adx_f >= 20: _add_item(col_t1, "ADX", f"{adx_f:.1f} (추세 있음)", "✅ good")
+                            elif adx_f < 15: _add_item(col_t1, "ADX", f"{adx_f:.1f} (횡보)", "❌ bad")
+                            else: _add_item(col_t1, "ADX", f"{adx_f:.1f} (보통)", "➖ normal")
+                        sma20 = last.get("SMA20")
+                        if sma20 is not None and close_val > 0 and np.isfinite(float(sma20)):
+                            above = close_val > float(sma20)
+                            _add_item(col_t1, "SMA20", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+                        sma50 = last.get("SMA50")
+                        if sma50 is not None and close_val > 0 and np.isfinite(float(sma50)):
+                            above = close_val > float(sma50)
+                            _add_item(col_t1, "SMA50", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+                        sma200 = last.get("SMA200")
+                        if sma200 is not None and close_val > 0 and np.isfinite(float(sma200)):
+                            above = close_val > float(sma200)
+                            _add_item(col_t1, "SMA200", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+                    with col_t2:
+                        s50, s150, s200 = last.get("SMA50"), last.get("SMA150"), last.get("SMA200")
+                        if all(x is not None and np.isfinite(float(x)) for x in (s50, s150, s200)):
+                            stack = float(s50) > float(s150) > float(s200)
+                            _add_item(col_t2, "이평 정렬", "50>150>200" if stack else "정렬 아님", "✅ good" if stack else "❌ bad")
+                        if len(df_tail) >= 21 and "High" in df_tail.columns:
+                            high20 = float(df_tail["High"].iloc[-21:-1].max())
+                            if high20 > 0:
+                                near_pct = close_val / high20 * 100
+                                if near_pct >= 98: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}% (근접)", "✅ good")
+                                elif near_pct < 95: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}% (멀음)", "➖ normal")
+                                else: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}%", "➖ normal")
+                        if "Volume" in df_tail.columns and len(df_tail) >= 20:
+                            vol = float(last.get("Volume", 0))
+                            vol20 = float(df_tail["Volume"].tail(20).mean())
+                            if vol20 > 0:
+                                vol_ratio = vol / vol20
+                                if vol_ratio >= 1.5: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x (강함)", "✅ good")
+                                elif vol_ratio < 0.7: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x (약함)", "❌ bad")
+                                else: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x", "➖ normal")
+                        if high_val > low_val and high_val > 0:
+                            rng = high_val - low_val
+                            upper_wick = (high_val - max(open_val, close_val)) / rng
+                            if upper_wick <= 0.3: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f} (낮음)", "✅ good")
+                            elif upper_wick >= 0.6: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f} (높음)", "❌ bad")
+                            else: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f}", "➖ normal")
+                        bullish = close_val > open_val
+                        _add_item(col_t2, "캔들", "양봉" if bullish else "음봉", "✅ good" if bullish else "❌ bad")
+                    with col_t3:
+                        if len(df_tail) >= 21 and "High" in df_tail.columns:
+                            high20_prev = float(df_tail["High"].iloc[-21:-1].max())
+                            if high20_prev > 0:
+                                close_confirm = close_val >= high20_prev * 1.001
+                                _add_item(col_t3, "종가확인(돌파)", "고점 위 마감" if close_confirm else "미확인", "✅ good" if close_confirm else "➖ normal")
+                        if sma50 is not None and sma200 is not None and np.isfinite(float(sma50)) and np.isfinite(float(sma200)):
+                            uptrend = float(sma50) > float(sma200)
+                            _add_item(col_t3, "추세(50>200)", "상승" if uptrend else "하락", "✅ good" if uptrend else "❌ bad")
+                else:
+                    st.markdown(_p("지표 데이터가 부족합니다."), unsafe_allow_html=True)
+            if res.get("df_1y") is not None and not res["df_1y"].empty:
+                st.markdown(
+                    "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
+                    "box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);"
+                    "margin:0.5rem 0;font-size:1.1rem;font-weight:700;'>📊 최근 1년 캔들 · 매수 ▲ / 매도 ▼ 신호</div>",
+                    unsafe_allow_html=True,
+                )
+                plot_candles_with_signals(
+                    res["df_1y"], f"{res['ticker']} 최근 1년 (매수/매도 신호)",
+                    res.get("buy_signal_dates") or [], res.get("sell_signal_dates") or [],
+                    res.get("sell_entry_prices") or [], chart_key="kr_ticker_1y_signals", dark=True, is_kr=True,
+                )
+            st.markdown("**최근 30봉 데이터(지표 포함)**")
+            df_tail = res.get("df_tail")
+            _render_aggrid(pd.DataFrame() if df_tail is None else df_tail, key="kr_aggrid_df_tail", kr_currency=True)
+
+            ticker_news, _ = _fetch_ticker_news(res.get("ticker", ""), is_kr=True, max_items=5)
+            with st.spinner("기사 요약 불러오는 중…"):
+                ticker_news = _enrich_news_with_summaries(ticker_news, st.session_state.get("news_refresh_ts", ""))
+            _render_ticker_news(ticker_news, res.get("ticker", ""))
+
+        st.divider()
+        st.markdown(
+            "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
+            "box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);"
+            "margin:0.5rem 0;font-size:1.1rem;font-weight:700;'>📊 오늘 가장 많이 검색한 한국증시 티커 20개</div>",
+            unsafe_allow_html=True,
+        )
+        _kr_trend_df = _fetch_trending_kr_tickers(20)
+        if not _kr_trend_df.empty:
+            _kr_disp = _kr_trend_df[["순위", "Ticker", "종목명", "현재가", "등락률(%)"]].copy()
+            _render_tracker_style_table(_kr_disp, pct_colors=True, col_widths=["5%", "12%", "38%", "22%", "23%"], kr_currency=True)
+        else:
+            st.info("한국 증시 트렌딩 티커 데이터를 불러올 수 없습니다.")
+        st.divider()
+        st.markdown("## 🧾 TOP PICK3 중 BUY 신호 성과 추적 (최대 15거래일)")
+        _kr_snap_path = get_latest_snapshot(SNAPSHOT_KR_PATTERN)
+        if _kr_snap_path is None:
+            st.info("한국 증시 스캔 데이터가 없습니다. 스캔 실행 탭에서 스캔을 실행해 주세요.")
+        else:
+            snap = load_scan_snapshot_only(_kr_snap_path)
+            if "error" in snap:
+                st.error(f"스냅샷 에러: {snap.get('error')} | path={snap.get('snapshot_path')}")
+            else:
+                def _df(x):
+                    return x if isinstance(x, pd.DataFrame) else pd.DataFrame(x)
+                top3 = _df(snap.get("top_picks"))
+                if top3.empty:
+                    st.info("TOP PICK3 후보가 없습니다.")
+                else:
+                    if "Entry" not in top3.columns:
+                        st.warning("top_picks에 'Entry' 컬럼이 없습니다.")
+                    else:
+                        top3_buy = top3[top3["Entry"].astype(str).isin(["BUY_BREAKOUT", "BUY_PULLBACK"])].copy()
+                        if "Promoted" in top3_buy.columns:
+                            top3_buy = top3_buy[~top3_buy["Promoted"].fillna(False).astype(bool)].copy()
+                        for col in ["PromoTag", "Tag", "Note", "Reasons", "EntryHint"]:
+                            if col in top3_buy.columns:
+                                top3_buy = top3_buy[~top3_buy[col].astype(str).str.contains("PROMOTED|BUY_PROMOTED", case=False, na=False)].copy()
+                        top3_buy_tickers = top3_buy["Ticker"].astype(str).str.upper().tolist() if "Ticker" in top3_buy.columns else []
+                        if not top3_buy_tickers:
+                            seeded = seed_tracker_from_recent_snapshots(max_files=120, max_seed=3, snapshot_pattern=SNAPSHOT_KR_PATTERN, tracker_path=TRACKER_KR_CSV)
+                            if seeded:
+                                st.info(f"스냅샷 기반으로 tracker를 복구했습니다: {', '.join(seeded)}")
+                                top3_buy_tickers = seeded[:]
+                            else:
+                                st.warning("스냅샷에서 복구할 BUY 종목을 찾지 못했습니다.")
+                        run_date = _parse_run_date(snap.get("run_date"))
+                        tr_all, closed_today = update_tracker_with_today(top3_buy_tickers, max_hold_days=15, run_date=run_date, tracker_path=TRACKER_KR_CSV, snapshot_pattern=SNAPSHOT_KR_PATTERN)
+                        today = datetime.utcnow().date()
+                        cum = compute_cum_returns(tr_all, today=today)
+                        top_pick_ret = compute_open_avg_return(tr_all)
+                        daily_change_avg = compute_open_daily_change_avg(tr_all)
+                        closed_count = int((tr_all["Status"] == "CLOSED").sum()) if "Status" in tr_all.columns else 0
+                        k0, k1, k2, k3, k4, k5 = st.columns(6)
+                        k0.metric("TOP PICK 수익률", f"{top_pick_ret:.2f}%")
+                        k1.metric("일간 수익률", f"{daily_change_avg:.2f}%")
+                        k2.metric("월간 수익률(누적)", f"{cum['monthly']:.2f}%")
+                        k3.metric("연간 수익률(누적)", f"{cum['yearly']:.2f}%")
+                        k4.metric("총 수익률(누적)", f"{cum['total']:.2f}%")
+                        k5.metric("추적 완료 종목", f"{closed_count}개")
+                        st.caption("※ TOP PICK 수익률: 현재 보유(OPEN) 종목들의 수익률 평균. 일간 수익률: 오늘 거래일 동안 변동된 수익률의 평균. 월간/연간/총 수익률: 해당 기간 CLOSED 종목들의 누적(복리) 수익률.")
+                        open_df = tr_all[tr_all["Status"] == "OPEN"].copy()
+                        if open_df.empty:
+                            st.info("현재 추적 중인 TOP PICK3 BUY 종목이 없습니다.")
+                        else:
+                            rows = []
+                            for _, r in open_df.iterrows():
+                                t = r["Ticker"]
+                                entry = float(r["EntryPrice"])
+                                cur_close, _ = _current_close(t)
+                                if cur_close is None:
+                                    continue
+                                ret = (cur_close / entry - 1) * 100.0
+                                rows.append({
+                                    "Name": TICKER_TO_NAME.get(str(t).upper(), str(t)),
+                                    "SignalDate": r.get("SignalDate"), "EntryDate": r.get("EntryDate"),
+                                    "EntryPrice(PrevClose)": entry, "Close(Now)": float(cur_close),
+                                    "Return%": round(ret, 2), "DaysHeld": int(r.get("DaysHeld", 0)),
+                                })
+                            _render_tracker_aggrid(rows, use_name=True, price_no_decimals=True)
+                        st.markdown("### ✅ 오늘 종료(CLOSED)된 종목(있으면 표시)")
+                        if closed_today is None or closed_today.empty:
+                            st.info("오늘 종료된 종목 없음")
+                        else:
+                            _closed = closed_today.copy()
+                            for c in ["Ticker", "SignalDate", "EntryDate", "EntryPrice", "ExitDate", "ExitPrice", "ReturnPct", "ExitReason"]:
+                                if c not in _closed.columns:
+                                    _closed[c] = ""
+                            _closed["Name"] = _closed["Ticker"].map(lambda x: TICKER_TO_NAME.get(str(x).upper(), str(x)))
+                            show_cols = ["Name", "SignalDate", "EntryDate", "EntryPrice", "ExitDate", "ExitPrice", "ReturnPct", "ExitReason"]
+                            _render_aggrid(_closed[show_cols], key="kr_aggrid_closed_today", kr_currency=True)
+
+    with kr_tab2:
+        st.subheader("포트폴리오 관리")
+        dfp = load_positions(POSITIONS_KR_PATH)
+        if st.session_state.pop("kr_portfolio_saved", False):
+            st.success("저장되었습니다.")
+        st.markdown("### 현재 포트폴리오")
+        if dfp.empty:
+            st.info("포트폴리오가 비어있습니다.")
+            cash_loaded = load_portfolio_cash(PORTFOLIO_CASH_KR_PATH)
+            st.metric("현금", _fmt_currency(cash_loaded, "kr"))
+        else:
+            rows = []
+            entry_date_map = {}
+            try:
+                tr = load_tracker(TRACKER_KR_CSV)
+                if tr is not None and not tr.empty and "Ticker" in tr.columns and "Status" in tr.columns and "EntryDate" in tr.columns:
+                    open_tr = tr[(tr["Status"].astype(str) == "OPEN") & (tr["Ticker"].notna())]
+                    for _, row in open_tr.iterrows():
+                        ticker_key = str(row["Ticker"]).upper().strip()
+                        ed = row.get("EntryDate")
+                        if pd.notna(ed):
+                            entry_date_map[ticker_key] = ed
+            except Exception:
+                entry_date_map = {}
+            for _, r in dfp.iterrows():
+                t = str(r["Ticker"]).upper()
+                shares = float(r["Shares"])
+                avg_price = float(r["AvgPrice"])
+                entry_date = entry_date_map.get(t)
+                try:
+                    rec = analyze_ticker_reco(t, shares=shares, avg_price=avg_price, entry_date=entry_date)
+                    t1, t2, t3 = None, None, None
+                    stop1, stop2, stop3 = None, None, None
+                    risk_action = ""
+                    if "error" in rec:
+                        recommend_text = "데이터 부족"
+                    else:
+                        tp = rec.get("tp", {}) or {}
+                        risk = rec.get("risk", {}) or {}
+                        t1 = tp.get("t1"); t2 = tp.get("t2"); t3 = tp.get("t3"); close = tp.get("close")
+                        stop1 = risk.get("Stop1Price")
+                        stop2 = risk.get("Stop2Price")
+                        stop3 = risk.get("Stop3Price")
+                        risk_action = risk.get("Action", "")
+                        base_reco = rec.get("reco", "")
+                        def _fmt(x):
+                            return "-" if (x is None or (not np.isfinite(float(x)))) else f"{float(x):.0f}"
+                        if risk_action in ("SELL_TRAIL", "SELL_TREND"):
+                            recommend_text = "매도(하락 추세 전환)"
+                        elif risk_action == "SELL_LOSS_CUT":
+                            recommend_text = "매도(손절)"
+                        elif risk_action == "SELL_STRUCTURE_BREAK":
+                            recommend_text = "매도(구조 붕괴)"
+                        else:
+                            if (close is not None and t3 is not None and np.isfinite(close) and np.isfinite(t3) and close >= t3):
+                                recommend_text = f"전량 매도(3차 목표 달성! {_fmt(t3)})"
+                            elif (close is not None and t2 is not None and np.isfinite(close) and np.isfinite(t2) and close >= t2):
+                                recommend_text = f"부분매도(2차 목표 달성! {_fmt(t2)})"
+                            elif (close is not None and t1 is not None and np.isfinite(close) and np.isfinite(t1) and close >= t1):
+                                recommend_text = f"부분 매도(1차 목표 달성! {_fmt(t1)})"
+                            else:
+                                if base_reco == "ADD_BUY":
+                                    recommend_text = f"추가매수 + 목표가 상향(1차 목표가 {_fmt(t1)})"
+                                else:
+                                    recommend_text = f"보유(1차 목표가 {_fmt(t1)})"
+                except Exception:
+                    recommend_text = "분석 실패"
+                    t1, t2, t3 = None, None, None
+                    stop1, stop2, stop3 = None, None, None
+                    risk_action = ""
+                    rec = {}
+                cur_close, _ = _current_close(t)
+                ret_pct = None
+                try:
+                    if cur_close is not None and np.isfinite(float(cur_close)) and avg_price > 0:
+                        ret_pct = (float(cur_close) / float(avg_price) - 1) * 100.0
+                except Exception:
+                    ret_pct = None
+                rows.append({
+                    "Ticker": t, "Shares": shares, "AvgPrice": avg_price,
+                    "ClosePrice": (round(float(cur_close), 0) if cur_close is not None and np.isfinite(float(cur_close)) else None),
+                    "Return%": (round(ret_pct, 2) if ret_pct is not None else np.nan),
+                    "Recommend": recommend_text,
+                    "risk_action": risk_action,
+                    "T1": t1, "T2": t2, "T3": t3,
+                    "Stop1": stop1, "Stop2": stop2, "Stop3": stop3,
+                })
+            pf_df = pd.DataFrame(rows)
+            # KR: 종목명 표시 (Ticker → Name)
+            pf_df["Name"] = pf_df["Ticker"].map(lambda x: TICKER_TO_NAME.get(str(x).upper(), str(x)))
+            display_cols = ["Name", "Shares", "AvgPrice", "ClosePrice", "Return%", "Recommend"]
+            _render_tracker_style_table(pf_df[display_cols], pct_colors=True, kr_currency=True)
+            inv_total = sum(float(r["Shares"]) * float(r["AvgPrice"]) for r in rows)
+            cur_total = sum(float(r["Shares"]) * (float(r["ClosePrice"]) if r.get("ClosePrice") is not None and np.isfinite(r.get("ClosePrice")) else float(r["AvgPrice"])) for r in rows)
+            inv_return = cur_total - inv_total
+            rets = [r["Return%"] for r in rows if r.get("Return%") is not None and np.isfinite(r.get("Return%"))]
+            avg_ret = sum(rets) / len(rets) if rets else 0.0
+            cash_display = load_portfolio_cash(PORTFOLIO_CASH_KR_PATH)
+            balance = inv_total + inv_return + cash_display
+            c1, c2, c3, c4, c5 = st.columns([1.25, 0.75, 1, 1, 1])
+            with c1:
+                st.metric("투자금", _fmt_currency(inv_total, "kr"))
+            with c2:
+                st.metric("평균 수익률", f"{avg_ret:.1f}%")
+            with c3:
+                st.metric("투자 수익", _fmt_currency(inv_return, "kr"))
+            with c4:
+                st.metric("현금", _fmt_currency(cash_display, "kr"))
+            with c5:
+                st.metric("잔고", _fmt_currency(balance, "kr"))
+            pie_labels = []
+            pie_values = []
+            for r in rows:
+                t = str(r.get("Ticker", "")).strip()
+                sh = float(r.get("Shares", 0) or 0)
+                close = r.get("ClosePrice")
+                if t and sh > 0 and close is not None and np.isfinite(float(close)):
+                    v = sh * float(close)
+                    pie_labels.append(TICKER_TO_NAME.get(t, t))
+                    pie_values.append(v)
+            if cash_display is not None and float(cash_display) >= 0:
+                pie_labels.append("현금")
+                pie_values.append(float(cash_display))
+            total_pie = sum(pie_values)
+            if total_pie > 0:
+                ticker_colors = ["#3b82f6", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#06b6d4", "#84cc16", "#f97316", "#6366f1", "#14b8a6"]
+                colors = [ticker_colors[i % len(ticker_colors)] for i in range(len(pie_labels) - 1)] + ["#22c55e"]
+                fig_pie = go.Figure(data=[go.Pie(
+                    labels=pie_labels, values=pie_values, hole=0.4,
+                    marker=dict(colors=colors, line=dict(color="rgba(15,23,42,0.9)", width=1.5)),
+                    textinfo="none", hovertemplate="%{label}: %{value:,.0f} (%{percent})<extra></extra>",
+                )])
+                fig_pie.update_layout(
+                    showlegend=False, margin=dict(l=20, r=20, t=30, b=20),
+                    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", height=320,
+                    font=dict(color="#e2e8f0", size=12),
+                    annotations=[dict(text="현재가치 기준", showarrow=False, font=dict(size=14), x=0.5, y=0.5)],
+                )
+                pct_list = [(l, (v / total_pie) * 100) for l, v in zip(pie_labels, pie_values)]
+                col_pie, col_ratio = st.columns([1.2, 1])
+                with col_pie:
+                    st.plotly_chart(fig_pie, use_container_width=True, key="kr_portfolio_pie")
+                with col_ratio:
+                    st.markdown("**비율 (현재가치 기준)**")
+                    for label, pct in pct_list:
+                        idx = pie_labels.index(label) if label in pie_labels else 0
+                        c = colors[idx] if idx < len(colors) else "#e2e8f0"
+                        box = f"<span style='display:inline-block;width:12px;height:12px;background-color:{c};margin-right:8px;vertical-align:middle;border-radius:2px;'></span>"
+                        st.markdown(f"{box} <span style='color:#e2e8f0'>{html.escape(label)}: **{pct:.1f}%**</span>", unsafe_allow_html=True)
+            st.caption("기준가: **매수가(평단가)**")
+            if "kr_portfolio_tp_override" not in st.session_state:
+                st.session_state["kr_portfolio_tp_override"] = {}
+            if "kr_portfolio_stop_override" not in st.session_state:
+                st.session_state["kr_portfolio_stop_override"] = {}
+            with st.expander("📌 ★1·2·3 목표가"):
+                target_rows = []
+                for _, r in pd.DataFrame(rows).iterrows():
+                    t = str(r["Ticker"]).strip()
+                    def _num(x):
+                        if x is None or (isinstance(x, float) and not np.isfinite(x)):
+                            return np.nan
+                        try:
+                            return float(x)
+                        except Exception:
+                            return np.nan
+                    ov = st.session_state["kr_portfolio_tp_override"].get(t, {})
+                    target_rows.append({
+                        "Name": TICKER_TO_NAME.get(t, t),
+                        "1차 목표가": ov.get("t1") if ov else _num(r.get("T1")),
+                        "2차 목표가": ov.get("t2") if ov else _num(r.get("T2")),
+                        "3차 목표가": ov.get("t3") if ov else _num(r.get("T3")),
+                    })
+                if target_rows:
+                    _tp_df = pd.DataFrame(target_rows)
+                    _render_tracker_style_table(_tp_df, col_widths=_TP_STOP_COL_WIDTHS, kr_currency=True)
+                else:
+                    st.caption("데이터 없음")
+            with st.expander("📌 ★1·2·3 손절가"):
+                stop_rows = []
+                for _, r in pd.DataFrame(rows).iterrows():
+                    t = str(r["Ticker"]).strip()
+                    def _num(x):
+                        if x is None or (isinstance(x, float) and not np.isfinite(x)):
+                            return np.nan
+                        try:
+                            return float(x)
+                        except Exception:
+                            return np.nan
+                    ov = st.session_state["kr_portfolio_stop_override"].get(t, {})
+                    stop_rows.append({
+                        "Name": TICKER_TO_NAME.get(t, t),
+                        "1차 손절가": ov.get("s1") if ov else _num(r.get("Stop1")),
+                        "2차 손절가": ov.get("s2") if ov else _num(r.get("Stop2")),
+                        "3차 손절가(전액)": ov.get("s3") if ov else _num(r.get("Stop3")),
+                    })
+                if stop_rows:
+                    _stop_df = pd.DataFrame(stop_rows)
+                    _render_tracker_style_table(_stop_df, col_widths=_TP_STOP_COL_WIDTHS, kr_currency=True)
+                else:
+                    st.caption("데이터 없음")
+            sell_tp_actions = ("SELL_TRAIL", "SELL_TREND", "SELL_STRUCTURE_BREAK", "SELL_LOSS_CUT", "TAKE_PROFIT")
+            sell_tp_rows = [r for r in rows if r.get("risk_action") in sell_tp_actions]
+            st.subheader("SELL / TAKE PROFIT 후보")
+            if sell_tp_rows:
+                _st_df = pd.DataFrame(sell_tp_rows)
+                _st_df["Name"] = _st_df["Ticker"].map(lambda x: TICKER_TO_NAME.get(str(x).upper(), str(x)))
+                _render_tracker_style_table(_st_df[["Name", "Shares", "AvgPrice", "ClosePrice", "Return%", "Recommend"]], pct_colors=True, kr_currency=True)
+            else:
+                st.info("현재 포트폴리오 중 매도/익절 권장 종목이 없습니다.")
+        st.markdown("### 추가/업데이트")
+        c1, c2, c3, c4 = st.columns([1.2, 1, 1, 1.2])
+        with c1:
+            t_add = st.text_input("종목명 또는 티커 추가", value="", key="kr_ticker_add",
+                placeholder="예: 카카오, 삼성전자 또는 035720.KQ",
+                help="종목명(카카오, 삼성전자 등) 또는 티커(035720.KQ) 입력")
+        with c2:
+            sh_add = st.number_input("Shares", min_value=0.0, value=0.0, step=1.0, key="kr_shares_add")
+        with c3:
+            ap_add = st.number_input("AvgPrice", min_value=0.0, value=0.0, step=1.0, key="kr_avgprice_add")
+        with c4:
+            mode = st.selectbox("동일 티커 처리", ["merge(가중평단 합산)", "replace(덮어쓰기)"], key="kr_mode_select")
+        if st.button("포트폴리오에 추가/업데이트", type="primary", key="kr_portfolio_add_btn"):
+            try:
+                t_resolved = _resolve_kr_name_or_ticker(t_add)
+                if not t_resolved:
+                    st.error("종목명 또는 티커를 입력하세요.")
+                else:
+                    m = "merge" if mode.startswith("merge") else "replace"
+                    df_new = add_or_merge(dfp.copy(), t_resolved, float(sh_add), float(ap_add), mode=m)
+                    save_positions(df_new, POSITIONS_KR_PATH)
+                    st.session_state["kr_portfolio_saved"] = True
+                    st.cache_data.clear()
+                    st.rerun()
+            except Exception as e:
+                st.error(str(e))
+        cash_loaded = load_portfolio_cash(PORTFOLIO_CASH_KR_PATH)
+        cash_new = st.number_input("현금 추가/업데이트", min_value=0.0, value=float(cash_loaded), step=100.0, key="kr_portfolio_cash_update")
+        if st.button("현금 반영", type="primary", key="kr_cash_btn"):
+            if abs(cash_new - cash_loaded) > 1e-6:
+                save_portfolio_cash(cash_new, PORTFOLIO_CASH_KR_PATH)
+                st.session_state["kr_portfolio_saved"] = True
+                st.rerun()
+            else:
+                st.info("변경 없음")
+        st.markdown("### 제거")
+        if dfp.empty:
+            st.info("positions_kr.csv가 비어있습니다.")
+        else:
+            t_list = dfp["Ticker"].astype(str).str.upper().tolist()
+            # 종목명으로 표시 (매핑 없으면 티커)
+            kr_del_options = [TICKER_TO_NAME.get(t, t) for t in t_list]
+            kr_display_to_ticker = {TICKER_TO_NAME.get(t, t): t for t in t_list}
+            t_del_display = st.selectbox("삭제할 종목 선택", kr_del_options, key="kr_ticker_del")
+            t_del = kr_display_to_ticker.get(t_del_display, t_del_display)
+            if st.button("선택한 종목 삭제", type="primary", key="kr_ticker_del_btn"):
+                df_new = remove_ticker(dfp.copy(), t_del)
+                save_positions(df_new, POSITIONS_KR_PATH)
+                st.success(f"{t_del_display} 삭제 완료!")
+                st.cache_data.clear()
+                st.rerun()
+
+    with kr_tab3:
+        st.subheader("🚀 스캔 실행 & 결과 (snapshot 표시 전용)")
+        kr_timeout = st.number_input("타임아웃(초)", min_value=60, value=900, step=60, key="kr_scan_timeout")
+        run_btn = st.button("🚀 스캔 실행", type="primary", key="kr_scan_btn")
+        if run_btn:
+            with st.status("scanner_kr.py 실행 중...", expanded=True) as status:
+                ok, msg, out, err = run_scanner_kr_subprocess(timeout_sec=int(kr_timeout))
+                st.write(msg)
+                with st.expander("stderr (always)", expanded=(not ok)):
+                    st.code((err or "(empty)")[-12000:])
+                with st.expander("stdout", expanded=False):
+                    st.code((out or "(empty)")[-12000:])
+                if ok:
+                    status.update(label="✅ scanner_kr.py 실행 완료", state="complete")
+                    st.session_state.pop("kr_scan_snap", None)
+                    st.cache_data.clear()
+                    st.rerun()
+                else:
+                    status.update(label="❌ scanner_kr.py 실행 실패/중단", state="error")
+        st.divider()
+        _kr_snap_path = get_latest_snapshot(SNAPSHOT_KR_PATTERN)
+        if _kr_snap_path is None:
+            st.info("한국 증시 스캔 데이터가 없습니다.")
+        else:
+            snap = load_scan_snapshot_only(_kr_snap_path)
+            if "error" in snap:
+                st.error(f"스냅샷 없음: {snap.get('snapshot_path')}")
+            else:
+                run_date = snap.get("run_date") or snap.get("date") or snap.get("asof") or snap.get("runDate")
+                if not run_date:
+                    sp = snap.get("snapshot_path") or ""
+                    run_date = os.path.basename(sp).replace("kr_scan_snapshot_", "").replace(".json", "") or str(datetime.utcnow().date())
+                ms = snap.get("market_state", {}) or {}
+                reg = ms.get("regime", "UNKNOWN")
+                score = ms.get("score")
+                score_str = f"{score}" if score is not None else "—"
+                if reg == "RISK_ON":
+                    st.markdown(f"**:green[🟢 현재 RISK_ON 상태입니다. (시장 점수 {score_str}점 / 100점)]**")
+                elif reg == "CAUTION":
+                    st.markdown(f"**:orange[🟡 현재 CAUTION 상태입니다. (시장 점수 {score_str}점 / 100점)]**")
+                elif reg == "RISK_OFF":
+                    st.markdown(f"**:red[🔴 현재 RISK_OFF 상태입니다. (시장 점수 {score_str}점 / 100점)]**")
+                else:
+                    st.markdown(f"**현재 {reg} 상태입니다. (시장 점수 {score_str}점 / 100점)**")
+
+                with st.expander("시장 상태 상세 (한국 증시 전용)"):
+                    def _badge(val, good_cond, bad_cond):
+                        if val is None:
+                            return "➖ normal"
+                        if good_cond(val):
+                            return "✅ good"
+                        if bad_cond(val):
+                            return "❌ bad"
+                        return "➖ normal"
+                    _p = lambda s: f"<p style='color:#f1f5f9;font-size:1.05rem;margin:0.22rem 0;'>{s}</p>"
+                    col_m1, col_m2 = st.columns(2)
+                    with col_m1:
+                        reg_badge = "✅ good" if reg == "RISK_ON" else ("❌ bad" if reg == "RISK_OFF" else "➖ normal")
+                        st.markdown(_p(f"regime: {reg} {reg_badge}"), unsafe_allow_html=True)
+                        if score is not None:
+                            sc_badge = _badge(score, lambda x: x >= 67, lambda x: x < 34)
+                            st.markdown(_p(f"score: {score} / 100 {sc_badge}"), unsafe_allow_html=True)
+                        # KOSPI / KOSDAQ SMA
+                        ki = ms.get("kospi") or {}
+                        qi = ms.get("kosdaq") or {}
+                        k50 = ki.get("sma50") or ms.get("spy_sma50")
+                        k200 = ki.get("sma200") or ms.get("spy_sma200")
+                        if k50 is not None or k200 is not None:
+                            st.markdown(_p(f"KOSPI SMA50: {k50} | SMA200: {k200} ➖ normal"), unsafe_allow_html=True)
+                        q50, q200 = qi.get("sma50"), qi.get("sma200")
+                        if q50 is not None or q200 is not None:
+                            st.markdown(_p(f"KOSDAQ SMA50: {q50} | SMA200: {q200} ➖ normal"), unsafe_allow_html=True)
+                        adx_val = ms.get("adx_spy")
+                        if adx_val is not None:
+                            try:
+                                adx_f = float(adx_val)
+                                adx_badge = _badge(adx_f, lambda x: x >= 20, lambda x: x < 15)
+                                st.markdown(_p(f"ADX(KOSPI): {adx_val} {adx_badge}"), unsafe_allow_html=True)
+                            except (TypeError, ValueError):
+                                st.markdown(_p(f"ADX(KOSPI): {adx_val} ➖ normal"), unsafe_allow_html=True)
+                        idx = ms.get("indices") or {}
+                        for sym in ["KOSPI", "KOSDAQ"]:
+                            d = idx.get(sym)
+                            if not isinstance(d, dict):
+                                continue
+                            a50, a200 = d.get("above_sma50"), d.get("above_sma200")
+                            a50_b = "✅ good" if a50 is True else ("❌ bad" if a50 is False else "➖ normal")
+                            a200_b = "✅ good" if a200 is True else ("❌ bad" if a200 is False else "➖ normal")
+                            st.markdown(_p(f"{sym} above_sma50: {a50} {a50_b} | above_sma200: {a200} {a200_b}"), unsafe_allow_html=True)
+                        top3_sector = ms.get("sector_5d_return_top3") or []
+                        if top3_sector:
+                            st.markdown(_p("**시장테마 TOP3 섹터**"), unsafe_allow_html=True)
+                            for i, s in enumerate(top3_sector, 1):
+                                name = s.get("name", s.get("ticker", "—"))
+                                ret = s.get("return_5d")
+                                r = f"{ret:+.2f}%" if ret is not None and np.isfinite(ret) else "—"
+                                st.markdown(_p(f"  {i}. {name} {r}"), unsafe_allow_html=True)
+                    with col_m2:
+                        vol_r = ms.get("spy_vol_ratio")
+                        if vol_r is not None:
+                            try:
+                                vol_f = float(vol_r)
+                                vol_badge = _badge(vol_f, lambda x: x >= 1.0, lambda x: x < 0.7)
+                                st.markdown(_p(f"KOSPI 거래량비(20d/5d): {vol_r} {vol_badge}"), unsafe_allow_html=True)
+                            except (TypeError, ValueError):
+                                st.markdown(_p(f"KOSPI 거래량비(20d/5d): {vol_r} ➖ normal"), unsafe_allow_html=True)
+                        label_kq = ms.get("kospi_vs_kosdaq_label")
+                        if label_kq:
+                            sector_val = ms.get("kospi_vs_kosdaq")
+                            sector_badge = "✅ good" if sector_val == "growth_lead" else ("❌ bad" if sector_val == "value_lead" else "➖ normal")
+                            st.markdown(_p(f"시장 테마: {label_kq} {sector_badge}"), unsafe_allow_html=True)
+                        vk = ms.get("vkospi") or ms.get("vix")
+                        if vk is not None:
+                            try:
+                                vk_f = float(vk)
+                                vk_b = _badge(vk_f, lambda x: x < 15, lambda x: x > 25)
+                                st.markdown(_p(f"VKOSPI: {vk} {vk_b}"), unsafe_allow_html=True)
+                            except (TypeError, ValueError):
+                                st.markdown(_p(f"VKOSPI: {vk}"), unsafe_allow_html=True)
+                        comp = ms.get("components") or {}
+                        comp_label = {"indices": "지수(KOSPI/KOSDAQ)", "adx": "ADX", "vix": "VKOSPI", "vol_ratio": "거래량비", "sector": "시장테마"}
+                        vk_val = ms.get("vkospi") or ms.get("vix")
+                        vol_val = ms.get("spy_vol_ratio")
+                        for k in ["indices", "adx", "vix", "vol_ratio", "sector"]:
+                            if k not in comp:
+                                continue
+                            v = comp[k]
+                            label = comp_label.get(k, k)
+                            if k == "vix" and vk_val is not None:
+                                extra = f" (실제값 {vk_val}, 점수 {v})"
+                            elif k == "vol_ratio" and vol_val is not None:
+                                extra = f" (실제값 {vol_val}, 점수 {v})"
+                            else:
+                                extra = ""
+                            if isinstance(v, (int, float)):
+                                cb = "✅ good" if v > 0 else ("❌ bad" if v < 0 else "➖ normal")
+                                st.markdown(_p(f"{label}: {v}{extra} {cb}"), unsafe_allow_html=True)
+                            else:
+                                st.markdown(_p(f"{label}: {v}{extra} ➖ normal"), unsafe_allow_html=True)
+
+                with st.expander("스캐너 도움말 (컬럼 설명)"):
+                    _h = lambda s: f"<p style='color:#e2e8f0;font-size:0.95rem;margin:0.15rem 0;'>{s}</p>"
+                    st.markdown(_h("**스캔 결과 테이블에 나오는 컬럼들의 간단한 의미입니다.**"), unsafe_allow_html=True)
+                    kr_help_items = [
+                        ("**Name**", "종목명 (예: 삼성전자, 카카오). 회사 이름입니다."),
+                        ("**Ticker**", "종목 코드 (예: 005930.KS, 035720.KQ). 코스피(.KS) / 코스닥(.KQ) 구분."),
+                        ("**Sector**", "해당 종목이 속한 업종/섹터 (예: Technology, Healthcare)."),
+                        ("**Entry**", "진입 신호 종류. BUY_BREAKOUT(돌파 매수), BUY_PULLBACK(눌림 매수), WATCH(관망) 등."),
+                        ("**EntryRaw**", "진입 신호의 원본 값. Entry와 동일하거나 세부 구분용입니다."),
+                        ("**Close**", "최근 거래일 종가(원화). 현재 기준 가격입니다."),
+                        ("**MktCap_KRW_T**", "시가총액(원화, 억원 단위). 회사 규모를 보는 지표입니다."),
+                        ("**EV**", "기대값(Expected Value). 확률×리워드 - (1-확률)×리스크로, 전략 기대 수익을 나타냅니다."),
+                        ("**Prob**", "승률 추정치(0~1). Score/Vol/RSI/ATR 등으로 산출한 확률입니다."),
+                        ("**RR**", "리워드/리스크 비율(Risk-Reward). 기대 수익 대비 손실 비율로, 1.5 이상이면 유리한 편입니다."),
+                        ("**Score**", "종합 점수. 여러 조건을 반영한 순위/점수입니다."),
+                        ("**VolRatio**", "거래량 비율. 최근 거래량이 평균(20일) 대비 몇 배인지 보여줍니다."),
+                        ("**RSI**", "RSI(14). 과매수(70 근처 이상)/과매도(30 근처 이하)를 보는 지표입니다."),
+                        ("**ATR%**", "ATR을 가격으로 나눈 비율(%). 변동성 크기를 보여줍니다."),
+                        ("**ADX**", "추세 강도 지표. 숫자가 클수록 추세가 뚜렷합니다 (보통 20 이상)."),
+                        ("**RS_vs_KOSPI or KOSDAQ**", "KOSPI(코스피) 또는 KOSDAQ(코스닥) 지수 대비 상대 강도. 시장보다 잘 오른 종목입니다."),
+                        ("**PctOff52H**", "52주 고점 대비 현재가가 몇 % 아래인지."),
+                        ("**Trigger**", "진입 신호가 나온 이유(트리거). 예: '20일 고점 돌파', 'SMA50 근처 반등' 등."),
+                        ("**EntryHint**", "진입 시 참고할 가격/조건."),
+                        ("**Invalidation**", "신호가 무효가 되는 조건. 손절가 도달 시 재검토합니다."),
+                        ("**Reasons**", "해당 진입/관망 판단의 근거를 요약한 텍스트입니다."),
+                        ("**MACDTrigger**", "MACD 지표로 인한 트리거(신호)가 있는지 여부입니다."),
+                        ("**Note**", "추가 메모. 이평 정렬, 시장 상태 등 보조 설명이 들어갑니다."),
+                        ("**EntryPrice**", "권장 진입가(원화)."),
+                        ("**StopPrice**", "손절가(원화). 이 가격 아래로 떨어지면 손절을 고려합니다."),
+                        ("**TargetPrice**", "목표가(원화). 익절을 노리는 가격대입니다."),
+                        ("**Shares**", "계산된 추천 매수 수량(주)."),
+                        ("**PosValue**", "포지션 규모(금액). EntryPrice × Shares."),
+                        ("**Avg$Vol**", "평균 거래대금(원화). 유동성 참고용입니다."),
+                        ("**P**", "진입 신호 타입 우선순위. 숫자가 작을수록 더 우선입니다."),
+                        ("**Promoted**", "BUY 신호 종목이 부족할 때 WATCH 중에서 선별해 승격시킨 종목입니다."),
+                    ]
+                    for label, desc in kr_help_items:
+                        st.markdown(_h(f"{label}: {desc}"), unsafe_allow_html=True)
+
+                def _df(x):
+                    return x if isinstance(x, pd.DataFrame) else pd.DataFrame(x)
+                df_all = _df(snap.get("df_all"))
+                buy_df = _df(snap.get("buy_df"))
+                watch_df = _df(snap.get("watch_df"))
+                top3 = _df(snap.get("top_picks"))
+                # KR: Name 컬럼 있으면 Ticker 숨김 (회사명만 표시)
+                def _kr_display(df):
+                    if df.empty:
+                        return df
+                    if "Name" in df.columns and "Ticker" in df.columns:
+                        return df.drop(columns=["Ticker"])
+                    return df
+                st.subheader("TOP PICKS")
+                if top3.empty:
+                    st.info("TOP PICK3 후보가 없습니다.")
+                else:
+                    _render_tracker_style_table(_kr_display(top3), kr_currency=True)
+                st.subheader("BUY")
+                _render_tracker_style_table(_kr_display(buy_df), kr_currency=True)
+                st.subheader("WATCH")
+                _render_tracker_style_table(_kr_display(watch_df), kr_currency=True)
+                with st.expander("ALL (raw)"):
+                    st.dataframe(_kr_display(df_all), use_container_width=True)
+    st.stop()
+
+# 미국 증시 스캐너
+# 우측 하단 고정 뒤로가기 버튼 (같은 탭에서 홈으로 이동)
+st.markdown(
+    '<form action="" method="get" target="_self" style="position:fixed;bottom:24px;right:24px;z-index:9999;">'
+    '<input type="hidden" name="goto" value="home" />'
+    '<button type="submit" style="padding:10px 16px;background:rgba(30,41,59,0.95);color:#e2e8f0;border-radius:8px;'
+    'font-size:0.9rem;border:1px solid rgba(100,116,139,0.4);cursor:pointer;'
+    'box-shadow:0 2px 8px rgba(0,0,0,0.3);">← 뒤로가기</button></form>',
+    unsafe_allow_html=True,
+)
 
 # 로고: 전체 상단, 탭 바로 위 (20% 확대, 왼쪽 아래 밀착)
 _logo_path = os.path.join(BASE_DIR, "assets", "us_swing_scanner_logo.png")
@@ -2365,411 +4084,386 @@ else:
 
 tab1, tab2, tab3 = st.tabs(["🔎 티커검색", "📁 포트폴리오 관리", "🚀 스캔 실행 (BUY/WATCH/SELL)"])
 
-with tab1:
-    # =========================
-    # 1) 티커 검색바 (최상단)
-    # =========================
-    st.subheader("티커 검색")
-    ticker = st.text_input("Ticker", value="AAPL", help="티커만 입력해서 조회")
-    ticker = (ticker or "").strip()
-
-    # 분석하기(왼쪽) · 닫기(오른쪽, 결과가 있을 때만 표시)
-    btn_col1, btn_col2 = st.columns([1, 1])
-    with btn_col1:
-        if ticker and st.button("분석하기", type="primary"):
-            res = analyze_ticker_reco(ticker, shares=1.0, avg_price=None)
-            if "error" in res:
-                st.error(res["error"])
-            st.session_state["ticker_result"] = res
-            st.session_state["show_ticker_result"] = True
-    with btn_col2:
+@_st_fragment
+def _render_us_tab1():
+        # =========================
+        # 1) 티커 검색바 (최상단)
+        # =========================
+        st.subheader("티커 검색")
+        ticker = st.text_input("Ticker", value="AAPL", help="티커만 입력해서 조회")
+        ticker = (ticker or "").strip()
+    
+        # 분석하기(왼쪽) · 닫기(오른쪽, 결과가 있을 때만 표시)
+        btn_col1, btn_col2 = st.columns([1, 1])
+        with btn_col1:
+            if ticker and st.button("분석하기", type="primary"):
+                res = analyze_ticker_reco(ticker, shares=1.0, avg_price=None)
+                if "error" in res:
+                    st.error(res["error"])
+                st.session_state["ticker_result"] = res
+                st.session_state["show_ticker_result"] = True
+        with btn_col2:
+            if st.session_state.get("show_ticker_result") and st.session_state.get("ticker_result"):
+                if st.button("닫기", key="close_ticker_result", type="secondary"):
+                    st.session_state["show_ticker_result"] = False
+                    st.session_state.pop("ticker_result", None)
+    
+        # 검색 결과를 트렌딩 20개 위에 표시
         if st.session_state.get("show_ticker_result") and st.session_state.get("ticker_result"):
-            if st.button("닫기", key="close_ticker_result", type="secondary"):
-                st.session_state["show_ticker_result"] = False
-                st.session_state.pop("ticker_result", None)
-                st.rerun()
-
-    # 저장된 결과가 있으면 차트/데이터 블록 표시
-    if st.session_state.get("show_ticker_result") and st.session_state.get("ticker_result"):
-        res = st.session_state["ticker_result"]
-
-        if "error" in res:
-            st.stop()
-
-        st.success(f"[{res['ticker']}] 추천: {res['reco']}")
-        st.write(res["why"])
-
-        tp = res.get("tp", {}) or {}
-        risk = res.get("risk", {}) or {}
-        t1, t2, t3 = tp.get("t1"), tp.get("t2"), tp.get("t3")
-        close = tp.get("close")
-        stop_2nd_pct = float(getattr(cfg, "SELL_2ND_CUT_PCT", 5.0))
-        loss_cut_pct = float(getattr(cfg, "SELL_LOSS_CUT_PCT", 10.0))
-        stop1 = risk.get("Stop1Price")
-        stop2 = risk.get("Stop2Price")
-        stop3 = risk.get("Stop3Price")
-        suggested_pct = risk.get("SuggestedSellPct")
-        suggested_reason = risk.get("SuggestedSellReason") or ""
-
-        def _fp(x):
-            if x is None or not np.isfinite(float(x)):
-                return "—"
-            return f"{float(x):,.2f}"
-
-        st.caption("기준가: **현재가** (티커만 입력 시)")
-        st.markdown("**1·2·3 목표가(익절)**")
-        st.markdown(f"- 현재가: {_fp(close)} → 1차: {_fp(t1)} · 2차: {_fp(t2)} · 3차: {_fp(t3)}")
-        st.markdown("**1·2·3 손절가** (1차 ≥ 2차 ≥ 3차)")
-        st.markdown(f"- 1차(트레일 이탈): {_fp(stop1)} · 2차(중간 -{stop_2nd_pct:.0f}%): {_fp(stop2)} · 3차(전액 -{loss_cut_pct:.0f}%): {_fp(stop3)}")
-        if (suggested_pct is not None and suggested_pct > 0) or (suggested_reason and str(suggested_reason).strip()):
-            pct_display = (suggested_pct * 100) if suggested_pct is not None and suggested_pct <= 1.0 else suggested_pct
-            st.markdown(f"- **권장 매도 비율(스케일아웃)**: {pct_display:.0f}% — {suggested_reason} (보유 수량 중 이 비율만큼 매도 권장)")
-
-        # 최근 매수/매도 신호 날짜·근거 (차트 위 한 줄씩)
-        buy_dates = res.get("buy_signal_dates") or []
-        sell_dates = res.get("sell_signal_dates") or []
-        buy_reasons = res.get("buy_reasons") or []
-        sell_reasons = res.get("sell_reasons") or []
-        last_buy_str = pd.Timestamp(buy_dates[-1]).strftime("%Y-%m-%d") if buy_dates else "—"
-        last_sell_str = pd.Timestamp(sell_dates[-1]).strftime("%Y-%m-%d") if sell_dates else "—"
-        last_buy_reason = (buy_reasons[-1] if buy_reasons else "") or "—"
-        last_sell_reason = (sell_reasons[-1] if sell_reasons else "") or "—"
-        st.markdown(f"**최근 매수 신호:** {last_buy_str} — {last_buy_reason}")
-        st.markdown(f"**최근 매도 신호:** {last_sell_str} — {last_sell_reason}")
-
-        # 종목 상태 상세 (시장상태상세 스타일, 스캐너 판단에 쓰는 지표 전부)
-        with st.expander("종목 상태 상세 (Ticker State)"):
-            _p = lambda s: f"<p style='color:#f1f5f9;font-size:1.05rem;margin:0.22rem 0;'>{s}</p>"
-            df_tail = res.get("df_tail")
-            if df_tail is not None and not df_tail.empty and len(df_tail) >= 2:
-                last = df_tail.iloc[-1]
-                prev = df_tail.iloc[-2]
-                close_val = float(last.get("Close", 0)) if "Close" in last else 0
-                open_val = float(last.get("Open", 0)) if "Open" in last else 0
-                high_val = float(last.get("High", 0)) if "High" in last else 0
-                low_val = float(last.get("Low", 0)) if "Low" in last else 0
-                prev_close = float(prev.get("Close", 0)) if "Close" in prev else close_val
-
-                col_t1, col_t2, col_t3 = st.columns(3)
-
-                def _add_item(col, label, val_str, badge):
-                    col.markdown(_p(f"{label}: {val_str} {badge}"), unsafe_allow_html=True)
-
-                with col_t1:
-                    # MACD
-                    macd_h = last.get("MACD_H")
-                    if macd_h is not None and np.isfinite(float(macd_h)):
-                        macd_h_f = float(macd_h)
-                        _add_item(col_t1, "MACD", "상승" if macd_h_f > 0 else "하락", "✅ good" if macd_h_f > 0 else "❌ bad")
-
-                    # RSI
-                    rsi_val = last.get("RSI14")
-                    if rsi_val is not None and np.isfinite(float(rsi_val)):
-                        rsi_f = float(rsi_val)
-                        if rsi_f < 30: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (과매도)", "✅ good")
-                        elif rsi_f > 70: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (과매수)", "❌ bad")
-                        else: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (적정)", "➖ normal")
-
-                    # 변동성(ATR%)
-                    atr14 = last.get("ATR14")
-                    if atr14 is not None and close_val > 0 and np.isfinite(float(atr14)):
-                        atr_pct = float(atr14) / close_val * 100
-                        if atr_pct < 2: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (낮음)", "❌ bad")
-                        elif atr_pct > 6: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (높음)", "❌ bad")
-                        else: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (적정)", "➖ normal")
-
-                    # ADX
-                    adx_val = last.get("ADX14")
-                    if adx_val is not None and np.isfinite(float(adx_val)):
-                        adx_f = float(adx_val)
-                        if adx_f >= 20: _add_item(col_t1, "ADX", f"{adx_f:.1f} (추세 있음)", "✅ good")
-                        elif adx_f < 15: _add_item(col_t1, "ADX", f"{adx_f:.1f} (횡보)", "❌ bad")
-                        else: _add_item(col_t1, "ADX", f"{adx_f:.1f} (보통)", "➖ normal")
-
-                    # SMA20
-                    sma20 = last.get("SMA20")
-                    if sma20 is not None and close_val > 0 and np.isfinite(float(sma20)):
-                        above = close_val > float(sma20)
-                        _add_item(col_t1, "SMA20", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
-
-                    # SMA50
-                    sma50 = last.get("SMA50")
-                    if sma50 is not None and close_val > 0 and np.isfinite(float(sma50)):
-                        above = close_val > float(sma50)
-                        _add_item(col_t1, "SMA50", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
-
-                    # SMA200
-                    sma200 = last.get("SMA200")
-                    if sma200 is not None and close_val > 0 and np.isfinite(float(sma200)):
-                        above = close_val > float(sma200)
-                        _add_item(col_t1, "SMA200", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
-
-                with col_t2:
-                    # 이평 정렬 (SMA50 > SMA150 > SMA200)
-                    s50 = last.get("SMA50"); s150 = last.get("SMA150"); s200 = last.get("SMA200")
-                    if all(x is not None and np.isfinite(float(x)) for x in (s50, s150, s200)):
-                        stack = float(s50) > float(s150) > float(s200)
-                        _add_item(col_t2, "이평 정렬", "50>150>200" if stack else "정렬 아님", "✅ good" if stack else "❌ bad")
-
-                    # 20일 고점 근접도
-                    if len(df_tail) >= 21 and "High" in df_tail.columns:
-                        high20 = float(df_tail["High"].iloc[-21:-1].max())
-                        if high20 > 0:
-                            near_pct = close_val / high20 * 100
-                            if near_pct >= 98: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}% (근접)", "✅ good")
-                            elif near_pct < 95: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}% (멀음)", "➖ normal")
-                            else: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}%", "➖ normal")
-
-                    # 거래량 비율
-                    if "Volume" in df_tail.columns and len(df_tail) >= 20:
-                        vol = float(last.get("Volume", 0))
-                        vol20 = float(df_tail["Volume"].tail(20).mean())
-                        if vol20 > 0:
-                            vol_ratio = vol / vol20
-                            if vol_ratio >= 1.5: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x (강함)", "✅ good")
-                            elif vol_ratio < 0.7: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x (약함)", "❌ bad")
-                            else: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x", "➖ normal")
-
-                    # 윗꼬리 비율 (돌파 품질)
-                    if high_val > low_val and high_val > 0:
-                        rng = high_val - low_val
-                        upper_wick = (high_val - max(open_val, close_val)) / rng
-                        if upper_wick <= 0.3: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f} (낮음)", "✅ good")
-                        elif upper_wick >= 0.6: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f} (높음)", "❌ bad")
-                        else: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f}", "➖ normal")
-
-                    # 갭/ATR (추격 위험)
-                    if atr14 is not None and np.isfinite(float(atr14)) and float(atr14) > 0:
-                        gap_atr = (open_val - prev_close) / float(atr14)
-                        if gap_atr <= 1.0: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f} (적정)", "✅ good")
-                        elif gap_atr > 1.2: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f} (추격위험)", "❌ bad")
-                        else: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f}", "➖ normal")
-
-                    # 캔들 (양봉/음봉)
-                    bullish = close_val > open_val
-                    _add_item(col_t2, "캔들", "양봉" if bullish else "음봉", "✅ good" if bullish else "❌ bad")
-
-                with col_t3:
-                    # 종가 확인 (돌파 시 고점 위 마감) - 20D고점 대비
-                    if len(df_tail) >= 21 and "High" in df_tail.columns:
-                        high20_prev = float(df_tail["High"].iloc[-21:-1].max())
-                        if high20_prev > 0:
-                            close_confirm = close_val >= high20_prev * 1.001
-                            _add_item(col_t3, "종가확인(돌파)", "고점 위 마감" if close_confirm else "미확인", "✅ good" if close_confirm else "➖ normal")
-
-                    # 52주 고점 근접 (있으면)
-                    if len(df_tail) >= 252 and "High" in df_tail.columns:
-                        high52 = float(df_tail["High"].tail(252).max())
-                        if high52 > 0:
-                            pct_off = (high52 - close_val) / high52 * 100
-                            if pct_off <= 10: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래 (근접)", "✅ good")
-                            elif pct_off > 25: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래 (멀음)", "❌ bad")
-                            else: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래", "➖ normal")
-
-                    # 2일 연속 SMA20 이탈 (매도 컨펌)
-                    prev_sma20 = prev.get("SMA20") if "SMA20" in prev else None
-                    if sma20 is not None and prev_sma20 is not None and np.isfinite(float(sma20)) and np.isfinite(float(prev_sma20)):
-                        two_day_below = (close_val < float(sma20)) and (prev_close < float(prev_sma20))
-                        _add_item(col_t3, "2일연속<SMA20", "이탈" if two_day_below else "미이탈", "❌ bad" if two_day_below else "➖ normal")
-
-                    # 추세 (SMA50 > SMA200)
-                    if sma50 is not None and sma200 is not None and np.isfinite(float(sma50)) and np.isfinite(float(sma200)):
-                        uptrend = float(sma50) > float(sma200)
-                        _add_item(col_t3, "추세(50>200)", "상승" if uptrend else "하락", "✅ good" if uptrend else "❌ bad")
-
-                    # 눌림 구간 (SMA20/SMA50 근접)
-                    if sma20 is not None and sma50 is not None and np.isfinite(float(sma20)) and np.isfinite(float(sma50)) and float(sma20) > 0 and float(sma50) > 0:
-                        near_20 = abs(close_val / float(sma20) - 1) <= 0.015
-                        near_50 = abs(close_val / float(sma50) - 1) <= 0.0225
-                        if near_20 or near_50:
-                            _add_item(col_t3, "눌림 구간", "SMA 근접" if (near_20 or near_50) else "—", "➖ normal")
-            else:
-                st.markdown(_p("지표 데이터가 부족합니다."), unsafe_allow_html=True)
-
-        if res.get("df_1y") is not None and not res["df_1y"].empty:
-            st.markdown(
-                "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
-                "box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);"
-                "margin:0.5rem 0;font-size:1.1rem;font-weight:700;'>📊 최근 1년 캔들 · 매수 ▲ / 매도 ▼ 신호</div>",
-                unsafe_allow_html=True,
-            )
-            plot_candles_with_signals(
-                res["df_1y"],
-                f"{res['ticker']} 최근 1년 (매수/매도 신호)",
-                res.get("buy_signal_dates") or [],
-                res.get("sell_signal_dates") or [],
-                res.get("sell_entry_prices") or [],
-                chart_key="ticker_1y_signals",
-                dark=True,
-            )
-        st.markdown("**최근 30봉 데이터(지표 포함)**")
-        _render_aggrid(res["df_tail"], key="aggrid_df_tail")
-
-    st.divider()
-
-    # =========================
-    # 2) 차트 3개: SPY / QQQ / USDKRW(환율)
-    # =========================
-    st.markdown(
-        "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
-        "box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);"
-        "margin:0.5rem 0;font-size:1.1rem;font-weight:700;'>📈 시장 차트 (최근 3개월 · 라인)</div>",
-        unsafe_allow_html=True,
-    )
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        spy_df = fetch_price("SPY", 400, get_cache_buster())
-        plot_candles(
-            spy_df,
-            "SPY (3M Line)",
-            chart_key="mkt_spy",
-            months=3,
-            kind="line",
-            show_ma=False,
-            dark=True,
+            res = st.session_state["ticker_result"]
+    
+            if "error" in res:
+                st.stop()
+    
+            st.success(f"[{res['ticker']}] 추천: {res['reco']}")
+            st.write(res["why"])
+    
+            tp = res.get("tp", {}) or {}
+            risk = res.get("risk", {}) or {}
+            t1, t2, t3 = tp.get("t1"), tp.get("t2"), tp.get("t3")
+            close = tp.get("close")
+            stop_2nd_pct = float(getattr(cfg, "SELL_2ND_CUT_PCT", 5.0))
+            loss_cut_pct = float(getattr(cfg, "SELL_LOSS_CUT_PCT", 10.0))
+            stop1 = risk.get("Stop1Price")
+            stop2 = risk.get("Stop2Price")
+            stop3 = risk.get("Stop3Price")
+            suggested_pct = risk.get("SuggestedSellPct")
+            suggested_reason = risk.get("SuggestedSellReason") or ""
+    
+            def _fp(x):
+                if x is None or not np.isfinite(float(x)):
+                    return "—"
+                return f"{float(x):,.2f}"
+    
+            st.caption("기준가: **현재가** (티커만 입력 시)")
+            st.markdown("**1·2·3 목표가(익절)**")
+            st.markdown(f"- 현재가: {_fp(close)} → 1차: {_fp(t1)} · 2차: {_fp(t2)} · 3차: {_fp(t3)}")
+            st.markdown("**1·2·3 손절가** (1차 ≥ 2차 ≥ 3차)")
+            st.markdown(f"- 1차(트레일 이탈): {_fp(stop1)} · 2차(중간 -{stop_2nd_pct:.0f}%): {_fp(stop2)} · 3차(전액 -{loss_cut_pct:.0f}%): {_fp(stop3)}")
+            if (suggested_pct is not None and suggested_pct > 0) or (suggested_reason and str(suggested_reason).strip()):
+                pct_display = (suggested_pct * 100) if suggested_pct is not None and suggested_pct <= 1.0 else suggested_pct
+                st.markdown(f"- **권장 매도 비율(스케일아웃)**: {pct_display:.0f}% — {suggested_reason} (보유 수량 중 이 비율만큼 매도 권장)")
+    
+            # 최근 매수/매도 신호 날짜·근거 (차트 위 한 줄씩)
+            buy_dates = res.get("buy_signal_dates") or []
+            sell_dates = res.get("sell_signal_dates") or []
+            buy_reasons = res.get("buy_reasons") or []
+            sell_reasons = res.get("sell_reasons") or []
+            last_buy_str = pd.Timestamp(buy_dates[-1]).strftime("%Y-%m-%d") if buy_dates else "—"
+            last_sell_str = pd.Timestamp(sell_dates[-1]).strftime("%Y-%m-%d") if sell_dates else "—"
+            last_buy_reason = (buy_reasons[-1] if buy_reasons else "") or "—"
+            last_sell_reason = (sell_reasons[-1] if sell_reasons else "") or "—"
+            st.markdown(f"**최근 매수 신호:** {last_buy_str} — {last_buy_reason}")
+            st.markdown(f"**최근 매도 신호:** {last_sell_str} — {last_sell_reason}")
+    
+            # 종목 상태 상세 (시장상태상세 스타일, 스캐너 판단에 쓰는 지표 전부)
+            with st.expander("종목 상태 상세 (Ticker State)"):
+                _p = lambda s: f"<p style='color:#f1f5f9;font-size:1.05rem;margin:0.22rem 0;'>{s}</p>"
+                df_tail = res.get("df_tail")
+                if df_tail is not None and not df_tail.empty and len(df_tail) >= 2:
+                    last = df_tail.iloc[-1]
+                    prev = df_tail.iloc[-2]
+                    close_val = float(last.get("Close", 0)) if "Close" in last else 0
+                    open_val = float(last.get("Open", 0)) if "Open" in last else 0
+                    high_val = float(last.get("High", 0)) if "High" in last else 0
+                    low_val = float(last.get("Low", 0)) if "Low" in last else 0
+                    prev_close = float(prev.get("Close", 0)) if "Close" in prev else close_val
+    
+                    col_t1, col_t2, col_t3 = st.columns(3)
+    
+                    def _add_item(col, label, val_str, badge):
+                        col.markdown(_p(f"{label}: {val_str} {badge}"), unsafe_allow_html=True)
+    
+                    with col_t1:
+                        # MACD
+                        macd_h = last.get("MACD_H")
+                        if macd_h is not None and np.isfinite(float(macd_h)):
+                            macd_h_f = float(macd_h)
+                            _add_item(col_t1, "MACD", "상승" if macd_h_f > 0 else "하락", "✅ good" if macd_h_f > 0 else "❌ bad")
+    
+                        # RSI
+                        rsi_val = last.get("RSI14")
+                        if rsi_val is not None and np.isfinite(float(rsi_val)):
+                            rsi_f = float(rsi_val)
+                            if rsi_f < 30: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (과매도)", "✅ good")
+                            elif rsi_f > 70: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (과매수)", "❌ bad")
+                            else: _add_item(col_t1, "RSI", f"{rsi_f:.1f} (적정)", "➖ normal")
+    
+                        # 변동성(ATR%)
+                        atr14 = last.get("ATR14")
+                        if atr14 is not None and close_val > 0 and np.isfinite(float(atr14)):
+                            atr_pct = float(atr14) / close_val * 100
+                            if atr_pct < 2: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (낮음)", "❌ bad")
+                            elif atr_pct > 6: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (높음)", "❌ bad")
+                            else: _add_item(col_t1, "변동성(ATR%)", f"{atr_pct:.2f}% (적정)", "➖ normal")
+    
+                        # ADX
+                        adx_val = last.get("ADX14")
+                        if adx_val is not None and np.isfinite(float(adx_val)):
+                            adx_f = float(adx_val)
+                            if adx_f >= 20: _add_item(col_t1, "ADX", f"{adx_f:.1f} (추세 있음)", "✅ good")
+                            elif adx_f < 15: _add_item(col_t1, "ADX", f"{adx_f:.1f} (횡보)", "❌ bad")
+                            else: _add_item(col_t1, "ADX", f"{adx_f:.1f} (보통)", "➖ normal")
+    
+                        # SMA20
+                        sma20 = last.get("SMA20")
+                        if sma20 is not None and close_val > 0 and np.isfinite(float(sma20)):
+                            above = close_val > float(sma20)
+                            _add_item(col_t1, "SMA20", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+    
+                        # SMA50
+                        sma50 = last.get("SMA50")
+                        if sma50 is not None and close_val > 0 and np.isfinite(float(sma50)):
+                            above = close_val > float(sma50)
+                            _add_item(col_t1, "SMA50", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+    
+                        # SMA200
+                        sma200 = last.get("SMA200")
+                        if sma200 is not None and close_val > 0 and np.isfinite(float(sma200)):
+                            above = close_val > float(sma200)
+                            _add_item(col_t1, "SMA200", "이평 위" if above else "이평 아래", "✅ good" if above else "❌ bad")
+    
+                    with col_t2:
+                        # 이평 정렬 (SMA50 > SMA150 > SMA200)
+                        s50 = last.get("SMA50"); s150 = last.get("SMA150"); s200 = last.get("SMA200")
+                        if all(x is not None and np.isfinite(float(x)) for x in (s50, s150, s200)):
+                            stack = float(s50) > float(s150) > float(s200)
+                            _add_item(col_t2, "이평 정렬", "50>150>200" if stack else "정렬 아님", "✅ good" if stack else "❌ bad")
+    
+                        # 20일 고점 근접도
+                        if len(df_tail) >= 21 and "High" in df_tail.columns:
+                            high20 = float(df_tail["High"].iloc[-21:-1].max())
+                            if high20 > 0:
+                                near_pct = close_val / high20 * 100
+                                if near_pct >= 98: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}% (근접)", "✅ good")
+                                elif near_pct < 95: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}% (멀음)", "➖ normal")
+                                else: _add_item(col_t2, "20D고점 근접", f"{near_pct:.1f}%", "➖ normal")
+    
+                        # 거래량 비율
+                        if "Volume" in df_tail.columns and len(df_tail) >= 20:
+                            vol = float(last.get("Volume", 0))
+                            vol20 = float(df_tail["Volume"].tail(20).mean())
+                            if vol20 > 0:
+                                vol_ratio = vol / vol20
+                                if vol_ratio >= 1.5: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x (강함)", "✅ good")
+                                elif vol_ratio < 0.7: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x (약함)", "❌ bad")
+                                else: _add_item(col_t2, "거래량비(Vol/20d)", f"{vol_ratio:.2f}x", "➖ normal")
+    
+                        # 윗꼬리 비율 (돌파 품질)
+                        if high_val > low_val and high_val > 0:
+                            rng = high_val - low_val
+                            upper_wick = (high_val - max(open_val, close_val)) / rng
+                            if upper_wick <= 0.3: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f} (낮음)", "✅ good")
+                            elif upper_wick >= 0.6: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f} (높음)", "❌ bad")
+                            else: _add_item(col_t2, "윗꼬리 비율", f"{upper_wick:.2f}", "➖ normal")
+    
+                        # 갭/ATR (추격 위험)
+                        if atr14 is not None and np.isfinite(float(atr14)) and float(atr14) > 0:
+                            gap_atr = (open_val - prev_close) / float(atr14)
+                            if gap_atr <= 1.0: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f} (적정)", "✅ good")
+                            elif gap_atr > 1.2: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f} (추격위험)", "❌ bad")
+                            else: _add_item(col_t2, "갭/ATR", f"{gap_atr:.2f}", "➖ normal")
+    
+                        # 캔들 (양봉/음봉)
+                        bullish = close_val > open_val
+                        _add_item(col_t2, "캔들", "양봉" if bullish else "음봉", "✅ good" if bullish else "❌ bad")
+    
+                    with col_t3:
+                        # 종가 확인 (돌파 시 고점 위 마감) - 20D고점 대비
+                        if len(df_tail) >= 21 and "High" in df_tail.columns:
+                            high20_prev = float(df_tail["High"].iloc[-21:-1].max())
+                            if high20_prev > 0:
+                                close_confirm = close_val >= high20_prev * 1.001
+                                _add_item(col_t3, "종가확인(돌파)", "고점 위 마감" if close_confirm else "미확인", "✅ good" if close_confirm else "➖ normal")
+    
+                        # 52주 고점 근접 (있으면)
+                        if len(df_tail) >= 252 and "High" in df_tail.columns:
+                            high52 = float(df_tail["High"].tail(252).max())
+                            if high52 > 0:
+                                pct_off = (high52 - close_val) / high52 * 100
+                                if pct_off <= 10: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래 (근접)", "✅ good")
+                                elif pct_off > 25: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래 (멀음)", "❌ bad")
+                                else: _add_item(col_t3, "52주고점", f"{pct_off:.1f}% 아래", "➖ normal")
+    
+                        # 2일 연속 SMA20 이탈 (매도 컨펌)
+                        prev_sma20 = prev.get("SMA20") if "SMA20" in prev else None
+                        if sma20 is not None and prev_sma20 is not None and np.isfinite(float(sma20)) and np.isfinite(float(prev_sma20)):
+                            two_day_below = (close_val < float(sma20)) and (prev_close < float(prev_sma20))
+                            _add_item(col_t3, "2일연속<SMA20", "이탈" if two_day_below else "미이탈", "❌ bad" if two_day_below else "➖ normal")
+    
+                        # 추세 (SMA50 > SMA200)
+                        if sma50 is not None and sma200 is not None and np.isfinite(float(sma50)) and np.isfinite(float(sma200)):
+                            uptrend = float(sma50) > float(sma200)
+                            _add_item(col_t3, "추세(50>200)", "상승" if uptrend else "하락", "✅ good" if uptrend else "❌ bad")
+    
+                        # 눌림 구간 (SMA20/SMA50 근접)
+                        if sma20 is not None and sma50 is not None and np.isfinite(float(sma20)) and np.isfinite(float(sma50)) and float(sma20) > 0 and float(sma50) > 0:
+                            near_20 = abs(close_val / float(sma20) - 1) <= 0.015
+                            near_50 = abs(close_val / float(sma50) - 1) <= 0.0225
+                            if near_20 or near_50:
+                                _add_item(col_t3, "눌림 구간", "SMA 근접" if (near_20 or near_50) else "—", "➖ normal")
+                else:
+                    st.markdown(_p("지표 데이터가 부족합니다."), unsafe_allow_html=True)
+    
+            if res.get("df_1y") is not None and not res["df_1y"].empty:
+                st.markdown(
+                    "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
+                    "box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);"
+                    "margin:0.5rem 0;font-size:1.1rem;font-weight:700;'>📊 최근 1년 캔들 · 매수 ▲ / 매도 ▼ 신호</div>",
+                    unsafe_allow_html=True,
+                )
+                plot_candles_with_signals(
+                    res["df_1y"],
+                    f"{res['ticker']} 최근 1년 (매수/매도 신호)",
+                    res.get("buy_signal_dates") or [],
+                    res.get("sell_signal_dates") or [],
+                    res.get("sell_entry_prices") or [],
+                    chart_key="ticker_1y_signals",
+                    dark=True,
+                )
+            st.markdown("**최근 30봉 데이터(지표 포함)**")
+            _render_aggrid(res["df_tail"], key="aggrid_df_tail")
+    
+            ticker_news, _ = _fetch_ticker_news(res.get("ticker", ""), is_kr=False, max_items=5)
+            with st.spinner("기사 요약 불러오는 중…"):
+                ticker_news = _enrich_news_with_summaries(ticker_news, st.session_state.get("news_refresh_ts", ""))
+            _render_ticker_news(ticker_news, res.get("ticker", ""))
+    
+        st.divider()
+        st.markdown(
+            "<div style='background:rgba(15,23,42,0.95);color:#f1f5f9;padding:12px 16px;border-radius:10px;"
+            "box-shadow:0 0 24px rgba(59,130,246,0.3);border:1px solid rgba(100,116,139,0.5);"
+            "margin:0.5rem 0;font-size:1.1rem;font-weight:700;'>📊 오늘 가장 많이 검색한 미국 증시 티커 20개</div>",
+            unsafe_allow_html=True,
         )
-
-    with c2:
-        qqq_df = fetch_price("QQQ", 400, get_cache_buster())
-        plot_candles(
-            qqq_df,
-            "QQQ (3M Line)",
-            chart_key="mkt_qqq",
-            months=3,
-            kind="line",
-            show_ma=False,
-            dark=True,
-        )
-
-    with c3:
-        fx_df = _get_usdkrw_df(lookback_days=900)
-        plot_candles(
-            fx_df,
-            "USD/KRW (3M Line)",
-            chart_key="mkt_usdkrw",
-            months=3,
-            kind="line",
-            show_ma=False,
-            dark=True,
-        )
-
-    st.divider()
-
-    # =========================
-    # 3) TOP PICK3 BUY 성과 트래커
-    # =========================
-    st.markdown("## 🧾 TOP PICK3 중 BUY 신호 성과 추적 (최대 15거래일)")
-
-    # (선택) 디버그 ON/OFF 스위치
-    DEBUG_SNAP = False
-
-    # --- TOP PICK3 tracker용 snapshot 확보 ---
-    snap = st.session_state.get("scan_snap")
-
-    if not isinstance(snap, dict):
-        snap = load_scan_snapshot_only()
-        st.session_state["scan_snap"] = snap
-
-    if DEBUG_SNAP:
-        st.write("SNAPSHOT KEYS:", list(snap.keys()))
-
-    if "error" in snap:
-        st.error(f"스냅샷 에러: {snap.get('error')} | path={snap.get('snapshot_path')}")
-        st.stop()
-
-    # --- snapshot에서 데이터 꺼내기 (항상 DataFrame으로 확정) ---
-    def _df(x):
-        return x if isinstance(x, pd.DataFrame) else pd.DataFrame(x)
-
-    top3 = _df(snap.get("top_picks"))
-
-    # --- TOP PICK3 중 BUY만 ---
-    if top3.empty:
-        st.info("TOP PICK3 후보가 없습니다.")
-    else:
-        if "Entry" not in top3.columns:
-            st.warning("top_picks에 'Entry' 컬럼이 없습니다. 스냅샷 포맷을 확인하세요.")
-            if DEBUG_SNAP:
-                _render_aggrid(top3, key="aggrid_top3_debug")
-            st.stop()
-
-        top3_buy = top3[top3["Entry"].astype(str).isin(["BUY_BREAKOUT", "BUY_PULLBACK"])].copy()
-
-        # ✅ promoted 제외(컬럼이 있으면)
-        if "Promoted" in top3_buy.columns:
-            top3_buy = top3_buy[~top3_buy["Promoted"].fillna(False).astype(bool)].copy()
-
-        # ✅ PromoTag/기타 문자열에도 PROMOTED가 섞인 케이스 방어
-        for col in ["PromoTag", "Tag", "Note", "Reasons", "EntryHint"]:
-            if col in top3_buy.columns:
-                top3_buy = top3_buy[~top3_buy[col].astype(str).str.contains("PROMOTED|BUY_PROMOTED", case=False, na=False)].copy()
-
-        top3_buy_tickers = top3_buy["Ticker"].astype(str).str.upper().tolist() if "Ticker" in top3_buy.columns else []
-        
-
-        # ✅ (핵심) tickers가 비면: 최근 스냅샷에서 seed 하고,
-        #    seed 된 tickers를 그대로 update_tracker_with_today에 넣는다.
-        if not top3_buy_tickers:
-            seeded = seed_tracker_from_recent_snapshots(max_files=120, max_seed=3)
-            if seeded:
-                st.info(f"스냅샷 기반으로 tracker를 복구했습니다: {', '.join(seeded)}")
-                top3_buy_tickers = seeded[:]   # ✅ 여기 핵심(빈 리스트로 update 호출 금지)
-            else:
-                st.warning("스냅샷에서 복구할 BUY 종목을 찾지 못했습니다.")
-
-        run_date = _parse_run_date(snap.get("run_date"))
-        tr_all, closed_today = update_tracker_with_today(top3_buy_tickers, max_hold_days=15, run_date=run_date)
-
-
-        today = datetime.utcnow().date()
-        cum = compute_cum_returns(tr_all, today=today)
-        top_pick_ret = compute_open_avg_return(tr_all)
-        daily_change_avg = compute_open_daily_change_avg(tr_all)
-
-        closed_count = int((tr_all["Status"] == "CLOSED").sum()) if "Status" in tr_all.columns else 0
-        k0, k1, k2, k3, k4, k5 = st.columns(6)
-        k0.metric("TOP PICK 수익률", f"{top_pick_ret:.2f}%")
-        k1.metric("일간 수익률", f"{daily_change_avg:.2f}%")
-        k2.metric("월간 수익률(누적)", f"{cum['monthly']:.2f}%")
-        k3.metric("연간 수익률(누적)", f"{cum['yearly']:.2f}%")
-        k4.metric("총 수익률(누적)", f"{cum['total']:.2f}%")
-        k5.metric("추적 완료 종목", f"{closed_count}개")
-
-        st.caption("※ TOP PICK 수익률: 현재 보유(OPEN) 종목들의 수익률 평균. 일간 수익률: 오늘 거래일 동안 변동된 수익률의 평균. 월간/연간/총 수익률: 해당 기간 CLOSED 종목들의 누적(복리) 수익률.")
-
-        open_df = tr_all[tr_all["Status"] == "OPEN"].copy()
-        if open_df.empty:
-            st.info("현재 추적 중인 TOP PICK3 BUY 종목이 없습니다.")
+        _trend_df = _fetch_trending_us_tickers(20)
+        if not _trend_df.empty:
+            _disp = _trend_df[["순위", "Ticker", "종목명", "현재가", "등락률(%)"]].copy()
+            _trend_col_widths = ["5%", "12%", "38%", "22%", "23%"]
+            _render_tracker_style_table(_disp, pct_colors=True, col_widths=_trend_col_widths)
         else:
-            rows = []
-            for _, r in open_df.iterrows():
-                t = r["Ticker"]
-                entry = float(r["EntryPrice"])
-                cur_close, _ = _current_close(t)
-                if cur_close is None:
-                    continue
-                ret = (cur_close / entry - 1) * 100.0
-                rows.append({
-                    "Ticker": t,
-                    "SignalDate": r.get("SignalDate"),
-                    "EntryDate": r.get("EntryDate"),
-                    "EntryPrice(PrevClose)": round(entry, 2),
-                    "Close(Now)": round(float(cur_close), 2),
-                    "Return%": round(ret, 2),
-                    "DaysHeld": int(r.get("DaysHeld", 0)),
-                })
-            _render_tracker_aggrid(rows)
-
-        st.markdown("### ✅ 오늘 종료(CLOSED)된 종목(있으면 표시)")
-        if closed_today is None or closed_today.empty:
-            st.info("오늘 종료된 종목 없음")
+            st.info("트렌딩 티커 데이터를 불러올 수 없습니다.")
+    
+        st.divider()
+    
+        # =========================
+        # 2) TOP PICK3 BUY 성과 트래커
+        # =========================
+        st.markdown("## 🧾 TOP PICK3 중 BUY 신호 성과 추적 (최대 15거래일)")
+    
+        # (선택) 디버그 ON/OFF 스위치
+        DEBUG_SNAP = False
+    
+        # --- TOP PICK3 tracker용 snapshot 확보 ---
+        snap = st.session_state.get("scan_snap")
+    
+        if not isinstance(snap, dict):
+            snap = load_scan_snapshot_only()
+            st.session_state["scan_snap"] = snap
+    
+        if DEBUG_SNAP:
+            st.write("SNAPSHOT KEYS:", list(snap.keys()))
+    
+        if "error" in snap:
+            st.error(f"스냅샷 에러: {snap.get('error')} | path={snap.get('snapshot_path')}")
+            st.stop()
+    
+        # --- snapshot에서 데이터 꺼내기 (항상 DataFrame으로 확정) ---
+        def _df(x):
+            return x if isinstance(x, pd.DataFrame) else pd.DataFrame(x)
+    
+        top3 = _df(snap.get("top_picks"))
+    
+        # --- TOP PICK3 중 BUY만 ---
+        if top3.empty:
+            st.info("TOP PICK3 후보가 없습니다.")
         else:
-            show_cols = ["Ticker","SignalDate","EntryDate","EntryPrice","ExitDate","ExitPrice","ReturnPct","ExitReason"]
-            for c in show_cols:
-                if c not in closed_today.columns:
-                    closed_today[c] = ""
-            _render_aggrid(closed_today[show_cols], key="aggrid_closed_today")
+            if "Entry" not in top3.columns:
+                st.warning("top_picks에 'Entry' 컬럼이 없습니다. 스냅샷 포맷을 확인하세요.")
+                if DEBUG_SNAP:
+                    _render_aggrid(top3, key="aggrid_top3_debug")
+                st.stop()
+    
+            top3_buy = top3[top3["Entry"].astype(str).isin(["BUY_BREAKOUT", "BUY_PULLBACK"])].copy()
+    
+            # ✅ promoted 제외(컬럼이 있으면)
+            if "Promoted" in top3_buy.columns:
+                top3_buy = top3_buy[~top3_buy["Promoted"].fillna(False).astype(bool)].copy()
+    
+            # ✅ PromoTag/기타 문자열에도 PROMOTED가 섞인 케이스 방어
+            for col in ["PromoTag", "Tag", "Note", "Reasons", "EntryHint"]:
+                if col in top3_buy.columns:
+                    top3_buy = top3_buy[~top3_buy[col].astype(str).str.contains("PROMOTED|BUY_PROMOTED", case=False, na=False)].copy()
+    
+            top3_buy_tickers = top3_buy["Ticker"].astype(str).str.upper().tolist() if "Ticker" in top3_buy.columns else []
+            
+    
+            # ✅ (핵심) tickers가 비면: 최근 스냅샷에서 seed 하고,
+            #    seed 된 tickers를 그대로 update_tracker_with_today에 넣는다.
+            if not top3_buy_tickers:
+                seeded = seed_tracker_from_recent_snapshots(max_files=120, max_seed=3)
+                if seeded:
+                    st.info(f"스냅샷 기반으로 tracker를 복구했습니다: {', '.join(seeded)}")
+                    top3_buy_tickers = seeded[:]   # ✅ 여기 핵심(빈 리스트로 update 호출 금지)
+                else:
+                    st.warning("스냅샷에서 복구할 BUY 종목을 찾지 못했습니다.")
+    
+            run_date = _parse_run_date(snap.get("run_date"))
+            tr_all, closed_today = update_tracker_with_today(top3_buy_tickers, max_hold_days=15, run_date=run_date)
+    
+    
+            today = datetime.utcnow().date()
+            cum = compute_cum_returns(tr_all, today=today)
+            top_pick_ret = compute_open_avg_return(tr_all)
+            daily_change_avg = compute_open_daily_change_avg(tr_all)
+    
+            closed_count = int((tr_all["Status"] == "CLOSED").sum()) if "Status" in tr_all.columns else 0
+            k0, k1, k2, k3, k4, k5 = st.columns(6)
+            k0.metric("TOP PICK 수익률", f"{top_pick_ret:.2f}%")
+            k1.metric("일간 수익률", f"{daily_change_avg:.2f}%")
+            k2.metric("월간 수익률(누적)", f"{cum['monthly']:.2f}%")
+            k3.metric("연간 수익률(누적)", f"{cum['yearly']:.2f}%")
+            k4.metric("총 수익률(누적)", f"{cum['total']:.2f}%")
+            k5.metric("추적 완료 종목", f"{closed_count}개")
+    
+            st.caption("※ TOP PICK 수익률: 현재 보유(OPEN) 종목들의 수익률 평균. 일간 수익률: 오늘 거래일 동안 변동된 수익률의 평균. 월간/연간/총 수익률: 해당 기간 CLOSED 종목들의 누적(복리) 수익률.")
+    
+            open_df = tr_all[tr_all["Status"] == "OPEN"].copy()
+            if open_df.empty:
+                st.info("현재 추적 중인 TOP PICK3 BUY 종목이 없습니다.")
+            else:
+                rows = []
+                for _, r in open_df.iterrows():
+                    t = r["Ticker"]
+                    entry = float(r["EntryPrice"])
+                    cur_close, _ = _current_close(t)
+                    if cur_close is None:
+                        continue
+                    ret = (cur_close / entry - 1) * 100.0
+                    rows.append({
+                        "Ticker": t,
+                        "SignalDate": r.get("SignalDate"),
+                        "EntryDate": r.get("EntryDate"),
+                        "EntryPrice(PrevClose)": round(entry, 2),
+                        "Close(Now)": round(float(cur_close), 2),
+                        "Return%": round(ret, 2),
+                        "DaysHeld": int(r.get("DaysHeld", 0)),
+                    })
+                _render_tracker_aggrid(rows)
+    
+            st.markdown("### ✅ 오늘 종료(CLOSED)된 종목(있으면 표시)")
+            if closed_today is None or closed_today.empty:
+                st.info("오늘 종료된 종목 없음")
+            else:
+                show_cols = ["Ticker","SignalDate","EntryDate","EntryPrice","ExitDate","ExitPrice","ReturnPct","ExitReason"]
+                for c in show_cols:
+                    if c not in closed_today.columns:
+                        closed_today[c] = ""
+                _render_aggrid(closed_today[show_cols], key="aggrid_closed_today")
+
+with tab1:
+    _render_us_tab1()
+
 
 
 
@@ -3257,7 +4951,7 @@ with tab3:
             ("**Entry**", "진입 신호 종류. BUY_BREAKOUT(돌파 매수), BUY_PULLBACK(눌림 매수), WATCH(관망) 등으로 표시됩니다."),
             ("**EntryRaw**", "진입 신호의 원본 값. Entry와 동일하거나 세부 구분용입니다."),
             ("**Close**", "최근 거래일 종가. 현재 기준 가격입니다."),
-            ("**MktCap_KRW_T**", "시가총액(원화, 조 단위). 회사 규모를 보는 지표입니다."),
+            ("**MktCap_KRW_T**", "시가총액(원화, 억원 단위). 1의 자리=억원. 회사 규모를 보는 지표입니다."),
             ("**EV**", "기업가치(Enterprise Value). 시가총액 + 부채 − 현금으로, 인수 시 필요한 규모를 나타냅니다."),
             ("**Prob**", "전략/모델에서 산출한 확률 관련 수치입니다."),
             ("**RR**", "리워드/리스크 비율(Risk-Reward). 기대 수익 대비 손실 비율로, 1.5 이상이면 유리한 편입니다."),

@@ -179,27 +179,7 @@ NASDAQ_NYSE_500 = [
     "RIVN","LCID","FSR","NKLA","GOEV","BLNK","CHPT","EVGO","VLDR","LAZR",
     "OUST","LIDR","AEYE","AEVA","INVZ","IMMR","MVIS","PLUG","BE","QS",
     "RIDE","HYLN","XPEV","LI","NIO","FUV","WKHS","ARVL","REE","ZEV",
-    "SOLO","FFIE","MULN","BOLT","BBAI","BFRG","SOUN","PRCH","GFAI","BOTZ",
-    "ROBO","IRBO","BLCN","LEGR","QQQJ","QQQM","VGT","IGV","HACK","SKYY",
-    "FDN","IWY","VUG","IVW","QUAL","MTUM","SCHA","VB","VXF","VTWO",
-    "IJR","IWM","SPSM","SLY","RUT","RTY","TNA","TZA","URTY","SRTY",
-    "LABU","LABD","TECL","TECS","SOXL","SOXS","FNGU","FNGD","TQQQ","SQQQ",
-    "QLD","PSQ","SPUU","SPXL","UPRO","SDS","SPXS","SH","RSP","EQAL",
-    "EQUAL","SPYV","IVE","IWF","IWD","IWR","VTV","VOE","VOT","RPV",
-    "RFV","IWS","IWN","VTWV","VBR","RZV","VBK","VO","VHG","VFH",
-    "VDC","VCR","VIS","VAW","VDE","VOX","VNQ","VNQI","VHT","VGH",
-    "BND","BNDX","AGG","LQD","HYG","JNK","TIP","TIPX","VTIP","SCHP",
-    "LTPZ","EDV","TLT","IEF","SHY","GOVT","FLOT","FLTR","MUB","PZA",
-    "TFI","HYD","EMB","PCY","CEW","FXF","FXE","FXB","FXY","FXA",
-    "UUP","UDN","GLD","SLV","IAU","GDX","GDXJ","COPX","CPER","DBA",
-    "DBC","USO","UNG","WEAT","CORN","SOYB","CANE","NIB","JO","BAL",
-    "COT","CTNN","VNM","EWZ","EWW","ECH","EPU","GXG","ILF","EEM",
-    "IEMG","VWO","SCHE","EWY","EWT","EWM","EWS","EPHE","EIDO","INDA",
-    "THD","KRE","KBE","KIE","KCE","XLF","XLK","XLE","XLV","XLI",
-    "XLP","XLY","XLB","XLU","XLRE","XLC","XBI","IBB","BBH","PPA",
-    "ITA","JETS","XHB","ITB","PKB","PBE","IGN","IYT","SEA","AIRR",
-    "BJK","TAN","ICLN","QCLN","PBW","ACES","CTEC","LIT","BATT","DRIV",
-    "IDRV","CLOU","WCLD","BUG","AIQ","CHAT","BLOK","BITS","BITQ","MSTR",
+    "SOLO","FFIE","MULN","BOLT","BBAI","BFRG","SOUN","PRCH","GFAI","MSTR",
     "COIN","RIOT","MARA","CLSK","CIFR","BTBT","BITF","HUT","CLEU","CORZ",
     "MIGI","SDIG","IREN","HIVEL","BTDR","APLD","HIVE","HOOD","SOFI","AFRM",
     "UPST","OPEN","LC","OPFI","LPRO","ML","NU","PAGS","GPN","ADYEN",
@@ -268,21 +248,15 @@ NASDAQ_NYSE_500_PART3 = [
     "EFX","TRU","DV","INFO","NLSN","IQV","CERN","CTSH","DXC","GRAB",
     "RBLX","U","DDOG","SNOW","NET","MDB","ZS","CRWD","OKTA","PATH",
     "ESTC","TEAM","DOCU","HUBS","TTD","SNDK","SMCI","ARM","PLTR","SHOP",
-    "QQQX","JEPI","JEPQ","XYLD","XYLE","DIVO","SCHD","VYM","DVY","HDV",
-    "SPHD","SPYD","FVD","FDL","DHS","DTD","FBT","IBB","XBI","XHE",
-    "XHS","IHI","PSJ","PJP","BBH","GNOM","ARKG","XLV","VHT","PBE",
-    "IDNA","BTEC","ROBT","BOTZ","IRBO","ROBO","TECL","SOXL","TQQQ","UPRO",
-    "SPXL","QLD","SSO","UMDD","MVV","URTY","TNA","ROM","RXL","UXIN",
+    "UXIN",
     "EH","DNUT","BROS","FAT","FATBB","CAVA","WING","SHAK","DPZ","PZZA",
     "YUM","YUMC","CMG","TXRH","BLMN","DRI","EAT","DARDEN","MCD","WEN",
     "JACK","BOJA","ARCO","TACO","LOCO","CABO","PTLO","DENN","NDLS","BURGER",
 ]
 
-# 나스닥/뉴욕증시 추가 PART4 (기존과 중복 없는 티커만)
+# 나스닥/뉴욕증시 추가 PART4 (기존과 중복 없는 티커만, ETF 제외)
 NASDAQ_NYSE_500_PART4 = [
-    "HCXY","SVOL","RYLD","QYLD","GROM","LLAP","FLBR","FLCH","FLEH","FLIN",
-    "FLIY","FLJP","FLKR","FLLA","FLTW","GLIN","KEMD","KEME","KEMG","KEMH",
-    "KEMJ","KEMK","KEML","KEMN","KEMQ","KEMX","XSD",
+    "GROM","LLAP",
 ]
 
 # 추천 추가 100종목 (제약/방산/에너지/소비재/금융/자동차/통신/리츠/철강/골드 등)

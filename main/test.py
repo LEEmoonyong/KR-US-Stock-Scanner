@@ -2403,7 +2403,7 @@ def score_stock(df, ticker, market_state=None, data=None):
         "EntryRaw": entry_raw,
         "Score": round(score, 1),
         "Close": round(last_close, 2),
-        "MktCap_KRW_T": round(mktcap_krw / 1e12, 1) if mktcap_krw else None,
+        "MktCap_KRW_T": round(mktcap_krw / 1e8, 0) if mktcap_krw else None,
         "Avg$Vol": int(dollar_vol_20),
         "VolRatio": round(vol_ratio, 2),
         "RSI": round(rsi_now, 1) if np.isfinite(rsi_now) else None,
@@ -3276,8 +3276,9 @@ def main():
     # -----------------------------
     df_all["MktPref"] = 0
     if "MktCap_KRW_T" in df_all.columns:
+        # 50~100조 = 50만억~100만억 = 500,000~1,000,000 억 (MktCap_KRW_T는 억원 단위)
         df_all["MktPref"] = df_all["MktCap_KRW_T"].apply(
-            lambda x: 1 if (pd.notna(x) and 50 <= float(x) <= 100) else 0
+            lambda x: 1 if (pd.notna(x) and 500000 <= float(x) <= 1000000) else 0
         )
         df_all.loc[df_all["MktPref"] == 1, "Score"] = df_all.loc[df_all["MktPref"] == 1, "Score"] + 8
 

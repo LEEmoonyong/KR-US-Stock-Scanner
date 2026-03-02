@@ -1,6 +1,7 @@
 DISCORD_WEBHOOK_URL = "weebhook"  # ⚠️ 반드시 새로 만든 웹훅 사용 권장(노출되면 스팸 가능)
 
 ACCOUNT_EQUITY_USD = 83000   # 계좌 총액(달러)
+ACCOUNT_EQUITY_KRW = None    # 한국 계좌 총액(원화). None이면 ACCOUNT_EQUITY_USD * KRW_PER_USD 사용
 RISK_PER_TRADE = 0.005        # 0.5% (1R 손실을 계좌의 0.5%로)
 
 MAX_BUY_PER_DAY = 10

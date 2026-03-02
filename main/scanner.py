@@ -443,6 +443,259 @@ def _drop_today_bar_if_needed(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 # -----------------------------
+# KR 전용 메타 캐시 (시총 KRW / 섹터) — 한국 주식은 yfinance가 KRW 반환
+# -----------------------------
+_meta_df_kr = None
+META_CACHE_KR_PATH = "meta_cache_kr.csv"
+
+def _is_kr_ticker(ticker: str) -> bool:
+    t = str(ticker).upper()
+    return t.endswith(".KS") or t.endswith(".KQ")
+
+def _load_meta_cache_kr():
+    global _meta_df_kr
+    if _meta_df_kr is not None:
+        return _meta_df_kr
+    path = os.path.join(SCANNER_BASE_DIR, META_CACHE_KR_PATH)
+    if os.path.exists(path):
+        try:
+            _meta_df_kr = pd.read_csv(path)
+            if "Ticker" in _meta_df_kr.columns:
+                _meta_df_kr["Ticker"] = _meta_df_kr["Ticker"].astype(str).str.upper()
+                _meta_df_kr = _meta_df_kr.drop_duplicates(subset=["Ticker"]).set_index("Ticker")
+            else:
+                _meta_df_kr = pd.DataFrame().set_index(pd.Index([], name="Ticker"))
+        except Exception:
+            _meta_df_kr = pd.DataFrame().set_index(pd.Index([], name="Ticker"))
+    else:
+        _meta_df_kr = pd.DataFrame().set_index(pd.Index([], name="Ticker"))
+    return _meta_df_kr
+
+def _get_meta_from_cache_kr(ticker: str):
+    dfm = _load_meta_cache_kr()
+    t = ticker.upper()
+    if t in dfm.index:
+        row = dfm.loc[t]
+        mkt = row.get("MarketCap_KRW") if "MarketCap_KRW" in dfm.columns else row.get("MarketCap")
+        sec = row.get("Sector") if "Sector" in dfm.columns else None
+        try:
+            mkt = None if pd.isna(mkt) else float(mkt)
+        except Exception:
+            mkt = None
+        sec = "Unknown" if (sec is None or (isinstance(sec, float) and np.isnan(sec))) else str(sec)
+        return mkt, sec
+    return None, None
+
+def _set_meta_cache_kr(ticker: str, market_cap_krw: float, sector: str):
+    global _meta_df_kr
+    dfm = _load_meta_cache_kr()
+    t = ticker.upper()
+    if _meta_df_kr is None or _meta_df_kr.empty:
+        _meta_df_kr = dfm.copy()
+    for col in ["MarketCap_KRW", "Sector"]:
+        if col not in _meta_df_kr.columns:
+            _meta_df_kr[col] = np.nan if col == "MarketCap_KRW" else "Unknown"
+    _meta_df_kr.loc[t, "MarketCap_KRW"] = market_cap_krw if market_cap_krw is not None else np.nan
+    _meta_df_kr.loc[t, "Sector"] = sector or "Unknown"
+    path = os.path.join(SCANNER_BASE_DIR, META_CACHE_KR_PATH)
+    out = _meta_df_kr.reset_index()
+    out.to_csv(path, index=False, encoding="utf-8-sig")
+
+def _get_market_cap_pykrx(ticker: str):
+    """pykrx로 시가총액 조회 (yfinance None일 때 fallback, 코스닥 포함)."""
+    try:
+        from pykrx import stock
+        code = ticker.split(".")[0].zfill(6)  # 035720.KQ → 035720
+        market = "KOSDAQ" if ticker.upper().endswith(".KQ") else "KOSPI"
+        dt = datetime.now().strftime("%Y%m%d")
+        df = stock.get_market_cap(dt, market=market)
+        if df is not None and not df.empty and code in df.index:
+            val = df.loc[code, "시가총액"]
+            if pd.notna(val) and np.isfinite(float(val)):
+                return float(val)
+    except Exception:
+        pass
+    return None
+
+def _get_market_cap_fdr(ticker: str):
+    """FinanceDataReader로 시가총액 조회 (pykrx 실패 시 fallback)."""
+    try:
+        import FinanceDataReader as fdr
+        code = ticker.split(".")[0].zfill(6)
+        market = "KOSDAQ" if ticker.upper().endswith(".KQ") else "KOSPI"
+        df = fdr.StockListing(market)
+        if df is not None and not df.empty and "Code" in df.columns:
+            row = df[df["Code"].astype(str).str.zfill(6) == code]
+            if not row.empty:
+                for col in ("MarCap", "Marcap", "시가총액", "MarketCap"):
+                    if col in row.columns:
+                        val = row.iloc[0][col]
+                        if pd.notna(val) and np.isfinite(float(val)):
+                            return float(val)
+        df_all = fdr.StockListing("KRX")
+        if df_all is not None and not df_all.empty and "Code" in df_all.columns:
+            row = df_all[df_all["Code"].astype(str).str.zfill(6) == code]
+            if not row.empty:
+                for col in ("MarCap", "Marcap", "시가총액", "MarketCap"):
+                    if col in row.columns:
+                        val = row.iloc[0][col]
+                        if pd.notna(val) and np.isfinite(float(val)):
+                            return float(val)
+    except Exception:
+        pass
+    return None
+
+_MARCAP_DF_CACHE = None
+
+def _load_marcap_latest():
+    """marcap 최신 데이터 로드. 로컬 marcap 폴더 또는 GitHub 다운로드."""
+    global _MARCAP_DF_CACHE
+    if _MARCAP_DF_CACHE is not None:
+        return _MARCAP_DF_CACHE
+    base = os.path.dirname(os.path.abspath(__file__))
+    cache_dir = os.path.join(base, "cache")
+    year = datetime.now().year
+    parquet_path = None
+    for parent in [base, os.path.dirname(base)]:
+        data_dir = os.path.join(parent, "marcap", "data")
+        for y in (year, year - 1):
+            p = os.path.join(data_dir, f"marcap-{y}.parquet")
+            if os.path.isfile(p):
+                parquet_path = p
+                break
+        if parquet_path:
+            break
+    if not parquet_path:
+        os.makedirs(cache_dir, exist_ok=True)
+        cached = os.path.join(cache_dir, f"marcap-{year}.parquet")
+        if os.path.isfile(cached):
+            parquet_path = cached
+        else:
+            try:
+                url = f"https://github.com/FinanceData/marcap/raw/master/data/marcap-{year}.parquet"
+                r = requests.get(url, timeout=60)
+                if r.status_code == 200 and len(r.content) > 1000:
+                    with open(cached, "wb") as f:
+                        f.write(r.content)
+                    parquet_path = cached
+            except Exception:
+                try:
+                    url = f"https://github.com/FinanceData/marcap/raw/master/data/marcap-{year-1}.parquet"
+                    r = requests.get(url, timeout=60)
+                    if r.status_code == 200 and len(r.content) > 1000:
+                        cached = os.path.join(cache_dir, f"marcap-{year-1}.parquet")
+                        with open(cached, "wb") as f:
+                            f.write(r.content)
+                        parquet_path = cached
+                except Exception:
+                    pass
+    if not parquet_path:
+        return None
+    try:
+        df = pd.read_parquet(parquet_path)
+        if df is None or df.empty or "Code" not in df.columns:
+            return None
+        for mcol in ("Marcap", "MarCap", "시가총액"):
+            if mcol in df.columns:
+                if "Date" in df.columns:
+                    latest = df["Date"].max()
+                    df = df[df["Date"] == latest].copy()
+                _MARCAP_DF_CACHE = df
+                return df
+    except Exception:
+        pass
+    return None
+
+def _get_market_cap_marcap(ticker: str):
+    """marcap 데이터셋으로 시가총액 조회 (pykrx/FDR 실패 시 fallback). 코스닥 포함."""
+    try:
+        df = _load_marcap_latest()
+        if df is None or df.empty:
+            return None
+        code = ticker.split(".")[0].zfill(6)
+        for mcol in ("Marcap", "MarCap", "시가총액"):
+            if mcol not in df.columns:
+                continue
+            df["_code"] = df["Code"].astype(str).str.zfill(6)
+            row = df[df["_code"] == code]
+            if row.empty:
+                continue
+            val = row.iloc[0][mcol]
+            if pd.notna(val) and np.isfinite(float(val)):
+                v = float(val)
+                return v * 1_000_000 if v < 1e10 else v
+            break
+    except Exception:
+        pass
+    return None
+
+def get_market_cap_krw(ticker: str):
+    """한국 주식(.KS/.KQ) 시총(KRW). yfinance 우선, 없으면 pykrx fallback(코스닥 포함)."""
+    if not _is_kr_ticker(ticker):
+        return None
+    mkt, sec = _get_meta_from_cache_kr(ticker)
+    if mkt is not None:
+        return mkt
+    if not getattr(cfg, "ALLOW_META_FETCH_IF_MISSING", True):
+        return None
+    mktcap_krw = None
+    sec = None
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        mc = info.get("marketCap")
+        curr = str(info.get("currency", "")).upper()
+        sec = info.get("sector") or info.get("industry") or _ticker_to_sector_fallback(ticker)
+        if mc is not None and np.isfinite(float(mc)):
+            mc = float(mc)
+            mktcap_krw = mc if curr == "KRW" else mc * getattr(cfg, "KRW_PER_USD", 1464.0)
+    except Exception:
+        pass
+    if mktcap_krw is None:
+        mktcap_krw = _get_market_cap_pykrx(ticker)
+    if mktcap_krw is None:
+        mktcap_krw = _get_market_cap_fdr(ticker)
+    if mktcap_krw is None:
+        mktcap_krw = _get_market_cap_marcap(ticker)
+    if sec is None:
+        sec = _ticker_to_sector_fallback(ticker)
+    _set_meta_cache_kr(ticker, mktcap_krw, sec or "Unknown")
+    return mktcap_krw
+
+def get_sector_kr(ticker: str):
+    """한국 주식 섹터. industry fallback + TICKER_TO_SECTOR 매핑."""
+    mkt_cached, sec_cached = _get_meta_from_cache_kr(ticker)
+    if sec_cached is not None and sec_cached != "Unknown":
+        return sec_cached
+    if not getattr(cfg, "ALLOW_META_FETCH_IF_MISSING", True):
+        return _ticker_to_sector_fallback(ticker)
+    try:
+        t = yf.Ticker(ticker)
+        info = t.info
+        sec = info.get("sector") or info.get("industry")
+        if sec:
+            sec = str(sec)
+        else:
+            sec = _ticker_to_sector_fallback(ticker)
+        mc = info.get("marketCap")
+        curr = str(info.get("currency", "")).upper()
+        mktcap_krw = None
+        if mc is not None and np.isfinite(float(mc)):
+            mc = float(mc)
+            mktcap_krw = mc if curr == "KRW" else mc * getattr(cfg, "KRW_PER_USD", 1464.0)
+        _set_meta_cache_kr(ticker, mktcap_krw, sec)
+        return sec
+    except Exception:
+        return _ticker_to_sector_fallback(ticker)
+
+def _ticker_to_sector_fallback(ticker: str):
+    try:
+        from ticker_universe_kr import TICKER_TO_SECTOR
+        return TICKER_TO_SECTOR.get(ticker.upper(), "Unknown")
+    except ImportError:
+        return "Unknown"
+
+# -----------------------------
 # 메타 (시총/섹터) — 캐시 우선
 # -----------------------------
 def get_market_cap_usd(ticker: str):
@@ -485,6 +738,10 @@ def get_market_cap_usd(ticker: str):
         return None
 
 def get_sector(ticker: str):
+    # KR 티커: 전용 로직 (industry fallback, TICKER_TO_SECTOR)
+    if _is_kr_ticker(ticker):
+        return get_sector_kr(ticker) or "Unknown"
+
     # 1) CSV 캐시 우선
     _, sec = _get_meta_from_cache(ticker)
     if sec is not None:
@@ -832,12 +1089,21 @@ def debug_trade_plan_rr(df2: pd.DataFrame, entry_type: str):
 # -----------------------------
 # 트레이드 플랜 + 포지션 사이징
 # -----------------------------
-def calc_trade_plan(df2: pd.DataFrame, entry_type: str):
+def _is_kr_ticker(ticker: Optional[str]) -> bool:
+    """한국 종목(.KS/.KQ) 여부"""
+    if not ticker:
+        return False
+    t = str(ticker).upper()
+    return t.endswith(".KS") or t.endswith(".KQ")
+
+
+def calc_trade_plan(df2: pd.DataFrame, entry_type: str, ticker: Optional[str] = None):
     """
     Trade plan 계산:
       - EntryPrice / StopPrice / TargetPrice / RR
       - Shares / PosValue (계좌 리스크 기반)
 
+    ticker: 한국 종목(.KS/.KQ)이면 원화 계좌 사용. 없으면 USD.
     ✅ RR 고정 방지:
       - min_target의 floor_atr를 종목별로 동적으로 조정(_dynamic_floor_atr)
       - Target은 base_target vs min_target 중 큰 값
@@ -926,15 +1192,37 @@ def calc_trade_plan(df2: pd.DataFrame, entry_type: str):
     # ----------------------------
     # 5) Position sizing
     # ----------------------------
-    equity = float(getattr(cfg, "ACCOUNT_EQUITY_USD", 0))
     risk_pct = float(getattr(cfg, "RISK_PER_TRADE", 0.0))
-    one_r_dollars = equity * risk_pct
+    is_kr = _is_kr_ticker(ticker)
+    if is_kr:
+        # 한국 종목: 가격/리스크가 원화 → 계좌도 원화 사용
+        equity_krw = getattr(cfg, "ACCOUNT_EQUITY_KRW", None)
+        if equity_krw is None or equity_krw <= 0:
+            # portfolio_cash_kr.txt 우선 (앱에서 설정한 현금)
+            cash_path = os.path.join(SCANNER_BASE_DIR, "portfolio_cash_kr.txt")
+            if os.path.exists(cash_path):
+                try:
+                    with open(cash_path, "r", encoding="utf-8") as f:
+                        v = float((f.read() or "0").strip())
+                    if v > 0:
+                        equity_krw = v
+                except Exception:
+                    pass
+        if equity_krw is None or equity_krw <= 0:
+            equity_usd = float(getattr(cfg, "ACCOUNT_EQUITY_USD", 0))
+            krw_per_usd = float(getattr(cfg, "KRW_PER_USD", 1400))
+            equity_krw = equity_usd * krw_per_usd
+        one_r_amount = float(equity_krw) * risk_pct  # 원화
+    else:
+        # 미국 종목: USD
+        equity = float(getattr(cfg, "ACCOUNT_EQUITY_USD", 0))
+        one_r_amount = equity * risk_pct  # 달러
 
-    if one_r_dollars <= 0:
+    if one_r_amount <= 0:
         shares = 0
         pos_value = 0.0
     else:
-        shares = int(one_r_dollars / risk_per_share)
+        shares = int(one_r_amount / risk_per_share)
         shares = max(0, shares)
         pos_value = shares * entry
 
@@ -1951,7 +2239,7 @@ def recommend_for_holding(df2, ticker, shares, avg_price):
     plan = None
     add_ok = False
     if str(entry).startswith("BUY_"):
-        plan = calc_trade_plan(df2, entry)
+        plan = calc_trade_plan(df2, entry, ticker=ticker)
         if plan is not None and plan["RR"] >= cfg.MIN_RR and plan["Shares"] > 0:
             add_ok = True
         else:
@@ -2193,7 +2481,7 @@ def analyze_single_ticker(ticker: str, shares: float = 0.0, avg_price: float = 0
     plan = None
 
     if str(entry).startswith("BUY_"):
-        plan = calc_trade_plan(df2, entry)
+        plan = calc_trade_plan(df2, entry, ticker=ticker)
         if plan is not None and plan["RR"] >= cfg.MIN_RR and plan["Shares"] > 0:
             add_ok = True
         else:
@@ -2434,7 +2722,7 @@ def compute_rs_vs_spy(df2, spy_close_series, lookback=20):
 # -----------------------------
 # 스코어/필터 (그대로)
 # -----------------------------
-def score_stock(df, ticker, market_state=None, data=None):
+def score_stock(df, ticker, market_state=None, data=None, benchmark_key=None, benchmark_label=None):
     if df is None or df.empty:
         return None
      # ✅ 데이터 품질 체크(신뢰도)
@@ -2480,8 +2768,11 @@ def score_stock(df, ticker, market_state=None, data=None):
         return None
 
     # 시총(선호/태그는 main에서 처리, 여기선 숫자만 가져오되 필터는 하지 않게 유지 가능)
-    mktcap_usd = get_market_cap_usd(ticker)
-    mktcap_krw = (mktcap_usd * cfg.KRW_PER_USD) if (mktcap_usd is not None) else None
+    if _is_kr_ticker(ticker):
+        mktcap_krw = get_market_cap_krw(ticker)
+    else:
+        mktcap_usd = get_market_cap_usd(ticker)
+        mktcap_krw = (mktcap_usd * cfg.KRW_PER_USD) if (mktcap_usd is not None) else None
     if cfg.USE_MKT_CAP_FILTER:
         if mktcap_krw is None or not (cfg.MKT_CAP_MIN_KRW <= mktcap_krw <= cfg.MKT_CAP_MAX_KRW):
             return None
@@ -2580,25 +2871,27 @@ def score_stock(df, ticker, market_state=None, data=None):
             entry = "WATCH_ADX"
             note = (str(note) + f" | 추세없음(ADX {adx14:.1f} < {min_adx})").strip(" |")
 
-    # ✅ Relative Strength (시장 대비 강도): SPY보다 약하면 BUY → WATCH_RS
-    # BUY/WATCH 모두 RS_vs_SPY 표시
+    # ✅ Relative Strength (시장 대비 강도): 벤치마크보다 약하면 BUY → WATCH_RS
+    # BUY/WATCH 모두 RS 표시 (benchmark_key/label 있으면 해당 지수 사용, 없으면 SPY)
     rs_txt = None
     rs_lookback = int(getattr(cfg, "RS_LOOKBACK_DAYS", 20))
+    bench_label = benchmark_label or "SPY"
     if (str(entry).startswith("BUY_") or str(entry).startswith("WATCH_")) and data is not None:
-        spy_close = None
+        bench_close = None
         try:
             if isinstance(data.columns, pd.MultiIndex):
-                if "SPY" in data.columns.get_level_values(0):
-                    spy_close = data["SPY"]["Close"].copy()
+                lookup = benchmark_key if benchmark_key else "SPY"
+                if lookup in data.columns.get_level_values(0):
+                    bench_close = data[lookup]["Close"].copy()
             else:
-                spy_close = data["Close"].copy() if "Close" in data.columns else None
+                bench_close = data["Close"].copy() if "Close" in data.columns else None
         except Exception:
-            spy_close = None
-        if spy_close is not None:
-            stock_ret, spy_ret = compute_rs_vs_spy(df2, spy_close, rs_lookback)
-            if stock_ret is not None and spy_ret is not None:
-                rs_txt = f"종목 {stock_ret*100:.1f}% vs SPY {spy_ret*100:.1f}%"
-                if str(entry).startswith("BUY_") and stock_ret <= spy_ret:
+            bench_close = None
+        if bench_close is not None:
+            stock_ret, bench_ret = compute_rs_vs_spy(df2, bench_close, rs_lookback)
+            if stock_ret is not None and bench_ret is not None:
+                rs_txt = f"종목 {stock_ret*100:.1f}% vs {bench_label} {bench_ret*100:.1f}%"
+                if str(entry).startswith("BUY_") and stock_ret <= bench_ret:
                     entry = "WATCH_RS"
                     note = (str(note) + f" | 시장대비 약함(RS {rs_lookback}일: {rs_txt})").strip(" |")
 
@@ -2638,7 +2931,7 @@ def score_stock(df, ticker, market_state=None, data=None):
 
 
     if str(entry).startswith("BUY_"):
-        plan = calc_trade_plan(df2, entry)
+        plan = calc_trade_plan(df2, entry, ticker=ticker)
 
         # 플랜 자체가 없으면 완전 SKIP
         if plan is None:
@@ -2650,6 +2943,19 @@ def score_stock(df, ticker, market_state=None, data=None):
                 entry = "CANDIDATE_BUY"
                 note = f"BUY 후보(미달): RR {plan['RR']} < {cfg.MIN_RR} 또는 Shares {plan['Shares']} → SMART 승격 후보"
 
+    # ✅ WATCH에도 RR/EV 표시용 플랜 계산 (RR=None이면 EV가 모두 동일해지는 문제 방지)
+    if plan is None and str(entry).startswith("WATCH_"):
+        plan_entry = None
+        if entry == "WATCH_BREAKOUT":
+            plan_entry = "BUY_BREAKOUT"
+        elif entry == "WATCH_PULLBACK":
+            plan_entry = "BUY_PULLBACK"
+        elif entry_raw in ("BUY_BREAKOUT", "WATCH_BREAKOUT"):
+            plan_entry = "BUY_BREAKOUT"
+        elif entry_raw in ("BUY_PULLBACK", "WATCH_PULLBACK"):
+            plan_entry = "BUY_PULLBACK"
+        if plan_entry:
+            plan = calc_trade_plan(df2, plan_entry, ticker=ticker)
 
     # 실행 가산점
     if str(entry).startswith("BUY_"): score += 10
@@ -2682,7 +2988,7 @@ def score_stock(df, ticker, market_state=None, data=None):
         "Entry": entry,
         "EntryRaw": entry_raw,
         "Close": round(last_close, 2),
-        "MktCap_KRW_T": round(mktcap_krw / 1e12, 1) if mktcap_krw else None,
+        "MktCap_KRW_T": round(mktcap_krw / 1e8, 0) if mktcap_krw else None,
         "EV": round(ev, 2) if ev is not None else None,
         "Prob": round(prob, 2) if prob is not None else None,
         "RR": plan["RR"] if plan else None,
@@ -3090,6 +3396,34 @@ def ev_rank_top_picks(buy_df: pd.DataFrame, n: int = 3) -> pd.DataFrame:
     return picks.head(n).copy()
 
 
+def _sync_buy_ev_prob_to_dfs(buy_df: pd.DataFrame, df_out: pd.DataFrame, df_all: pd.DataFrame):
+    """
+    ✅ buy_df(ev_rank_top_picks 결과)의 EV/Prob를 df_out·df_all의 BUY 행에 반영.
+    미국·한국 스캐너 동일: CSV·스냅샷에 ev_rank 기준 EV/Prob 사용.
+    """
+    if buy_df is None or buy_df.empty or "Ticker" not in buy_df.columns:
+        return
+    if "EV" not in buy_df.columns or "Prob" not in buy_df.columns:
+        return
+    for target in [df_out, df_all]:
+        if target is None or target.empty or "Ticker" not in target.columns:
+            continue
+        if "EV" not in target.columns:
+            target["EV"] = np.nan
+        if "Prob" not in target.columns:
+            target["Prob"] = np.nan
+        for _, br in buy_df.iterrows():
+            t = str(br.get("Ticker", "")).upper().strip()
+            if not t:
+                continue
+            ev_val = br.get("EV")
+            prob_val = br.get("Prob")
+            mask = target["Ticker"].astype(str).str.upper().str.strip() == t
+            if mask.any():
+                target.loc[mask, "EV"] = ev_val
+                target.loc[mask, "Prob"] = prob_val
+
+
 def calc_prob_ev_like_discord(row: dict, market_state: dict | None = None):
     """
     ✅ 디스코드 ev_rank_top_picks()와 동일한 Prob/EV 계산(행 단위)
@@ -3426,6 +3760,138 @@ def embed_for_risk(risk_df, run_date):
     }
 
 
+def apply_smart_relax_promote(df_all, buy_df, watch_df, data, run_date="", rs_col="RS_vs_SPY", benchmark_key_func=None):
+    """
+    BUY가 적을 때 WATCH에서 승격. US/KR 공통 사용.
+    rs_col: KR은 "RS_vs_KOSPI or KOSDAQ", US는 "RS_vs_SPY"
+    benchmark_key_func: ticker -> benchmark_key (KR: .KQ->^KQ11, .KS->^KS11)
+    """
+    if not getattr(cfg, "SMART_RELAX_ENABLED", False):
+        return buy_df
+    min_buy = int(getattr(cfg, "SMART_MIN_BUY", 3))
+    if buy_df is None or not isinstance(buy_df, pd.DataFrame):
+        buy_df = pd.DataFrame()
+    if len(buy_df) >= min_buy:
+        return buy_df
+    relaxed_rr = float(getattr(cfg, "SMART_MIN_RR", max(1.2, cfg.MIN_RR - 0.3)))
+    relaxed_vol = float(getattr(cfg, "SMART_BUY_BREAKOUT_VOL_X", cfg.BREAKOUT_VOL_X))
+    need = int(cfg.MAX_BUY_PER_DAY - len(buy_df))
+    if need <= 0:
+        return buy_df
+    if (df_all is None) or (not isinstance(df_all, pd.DataFrame)) or df_all.empty:
+        return buy_df
+    cand = df_all[df_all["Entry"].astype(str).isin([
+        "CANDIDATE_BUY", "WATCH_BREAKOUT", "WATCH_PULLBACK",
+        "WATCH_52WK", "WATCH_MA_STACK"
+    ])].copy()
+    if cand.empty or "Ticker" not in cand.columns:
+        return buy_df
+    is_candbuy = cand["Entry"].astype(str) == "CANDIDATE_BUY"
+    candbuy = cand[is_candbuy].copy()
+    watch_cand = cand[~is_candbuy].copy()
+    candbuy = candbuy[candbuy["RR"].fillna(-1) >= relaxed_rr]
+    cand = pd.concat([candbuy, watch_cand], ignore_index=True)
+    def _vol_ok(row):
+        e, raw = str(row.get("Entry", "")), str(row.get("EntryRaw", ""))
+        if (raw == "BUY_BREAKOUT") or (e == "WATCH_BREAKOUT"):
+            return float(row.get("VolRatio", 0) or 0) >= relaxed_vol
+        return True
+    cand = cand[cand.apply(_vol_ok, axis=1)]
+    already = set(buy_df["Ticker"].astype(str).tolist()) if not buy_df.empty and "Ticker" in buy_df.columns else set()
+    cand = cand[~cand["Ticker"].astype(str).isin(already)]
+    if cand.empty:
+        return buy_df
+    cand = cand.sort_values(["Score", "Avg$Vol"], ascending=[False, False]).head(need).copy()
+    rs_lookback = int(getattr(cfg, "RS_LOOKBACK_DAYS", 20))
+
+    def _get_bench_close(tkr):
+        if data is None or not isinstance(data.columns, pd.MultiIndex):
+            return None
+        key = benchmark_key_func(tkr) if benchmark_key_func else "SPY"
+        if key in data.columns.get_level_values(0):
+            return data[key]["Close"].copy()
+        return data["SPY"]["Close"].copy() if "SPY" in data.columns.get_level_values(0) else None
+
+    def _tag(row):
+        row["Entry"] = "BUY_SMART"
+        row["Promoted"] = True
+        row["PromoTag"] = "🟣✅ PROMOTED"
+        need_rs = not (row.get(rs_col) if rs_col in row.index else row.get(rs_col, None)) or not str(row.get(rs_col, "") or "").strip()
+        if need_rs and rs_col == "RS_vs_SPY":
+            tkr = row.get("Ticker")
+            if tkr:
+                df_t = data[tkr].copy() if (data is not None and isinstance(data.columns, pd.MultiIndex) and tkr in data.columns.get_level_values(0)) else None
+                spy_close = _get_bench_close(tkr)
+                if df_t is None or spy_close is None or len(df_t) < rs_lookback + 1:
+                    try:
+                        dl = yf.download([tkr, "SPY"], period="1y", interval="1d", group_by="ticker", auto_adjust=False, progress=False, threads=False)
+                        if dl is not None and not dl.empty and isinstance(dl.columns, pd.MultiIndex):
+                            df_t = dl[tkr].copy() if tkr in dl.columns.get_level_values(0) else None
+                            spy_close = dl["SPY"]["Close"].copy() if "SPY" in dl.columns.get_level_values(0) else None
+                    except Exception:
+                        pass
+                if df_t is not None and not df_t.empty and spy_close is not None and len(df_t) >= rs_lookback + 1:
+                    try:
+                        stock_ret, spy_ret = compute_rs_vs_spy(df_t, spy_close, rs_lookback)
+                        if stock_ret is not None and spy_ret is not None:
+                            row[rs_col] = f"종목 {stock_ret*100:.1f}% vs SPY {spy_ret*100:.1f}%"
+                    except Exception:
+                        pass
+        try:
+            tkr = row.get("Ticker")
+            if not tkr or data is None or not isinstance(data.columns, pd.MultiIndex) or tkr not in data.columns.get_level_values(0):
+                return row
+            dfp = data[tkr].copy()
+            if isinstance(dfp.columns, pd.MultiIndex):
+                dfp.columns = dfp.columns.get_level_values(0)
+            dfp = dfp.dropna(subset=["Open","High","Low","Close","Volume"]).copy()
+            close = dfp["Close"]
+            dfp["SMA20"] = sma(close, 20)
+            dfp["SMA50"] = sma(close, 50)
+            dfp["SMA200"] = sma(close, 200)
+            dfp["ATR14"] = atr(dfp, 14)
+            dfp["ADX14"] = adx(dfp, 14)
+            dfp2 = dfp.dropna().copy()
+            if len(dfp2) < 140:
+                return row
+            raw = row.get("EntryRaw", None)
+            if raw == "WATCH_BREAKOUT":
+                raw = "BUY_BREAKOUT"
+            elif raw == "WATCH_PULLBACK":
+                raw = "BUY_PULLBACK"
+            if raw not in ("BUY_BREAKOUT", "BUY_PULLBACK"):
+                return row
+            plan = calc_trade_plan(dfp2, raw, ticker=tkr)
+            if not plan or (plan["TargetPrice"] <= plan["EntryPrice"] * 1.002) or (plan["RR"] < relaxed_rr):
+                row["Promoted"] = False
+                row["PromoTag"] = ""
+                return row
+            row["EntryPrice"] = plan["EntryPrice"]
+            row["StopPrice"] = plan["StopPrice"]
+            row["TargetPrice"] = plan["TargetPrice"]
+            row["RR"] = plan["RR"]
+            row["Shares"] = plan["Shares"]
+            row["PosValue"] = plan["PosValue"]
+            row["Note"] = f"[BUY 탈락 이유: {str(row.get('Note','')).strip() or '(사유 없음)'}] [Promoted 선정 이유: SMART 승격 (RR/볼륨 완화 조건 충족)]"
+        except Exception:
+            pass
+        return row
+
+    cand = cand.apply(_tag, axis=1)
+    cand = cand[cand["Promoted"].fillna(False).astype(bool)].copy() if "Promoted" in cand.columns else pd.DataFrame()
+    if cand.empty:
+        return buy_df
+    buy_df = pd.concat([buy_df, cand], ignore_index=True) if not buy_df.empty else cand.copy()
+    buy_df = buy_df.head(cfg.MAX_BUY_PER_DAY)
+    for col in ["Shares", "PosValue", "EntryPrice", "StopPrice", "TargetPrice"]:
+        if col not in buy_df.columns:
+            buy_df[col] = np.nan
+    buy_df = buy_df.dropna(subset=["Shares", "PosValue", "EntryPrice", "StopPrice", "TargetPrice"]).copy()
+    if not buy_df.empty:
+        buy_df = ev_rank_top_picks(buy_df, n=cfg.MAX_BUY_PER_DAY)
+    return buy_df
+
+
 # -----------------------------
 # 메인 (속도 개선 + WATCH 별도 + 시총 선호 가산점 + 보유 매도/익절 신호)
 # -----------------------------
@@ -3670,191 +4136,13 @@ def main():
     # =========================
     # ✅ SMART RELAX: BUY가 너무 적을 때만 후보 승격
     # =========================
-    if getattr(cfg, "SMART_RELAX_ENABLED", False):
-        min_buy = int(getattr(cfg, "SMART_MIN_BUY", 3))
-
-        # buy_df는 여기서 "진짜 BUY_"만 포함
-        if len(buy_df) < min_buy:
-            relaxed_rr = float(getattr(cfg, "SMART_MIN_RR", max(1.2, cfg.MIN_RR - 0.3)))
-            relaxed_vol = float(getattr(cfg, "SMART_BUY_BREAKOUT_VOL_X", cfg.BREAKOUT_VOL_X))
-
-            need = int(cfg.MAX_BUY_PER_DAY - len(buy_df))
-            if need > 0:
-                # ✅ 후보 풀 확장: CANDIDATE_BUY + WATCH_* 에서도 승격 가능
-                # (BUY가 적을 때 "WATCH에서 몇 종목 승격"이 실제로 되게 함)
-                if (df_all is None) or (not isinstance(df_all, pd.DataFrame)) or df_all.empty:
-                    cand = pd.DataFrame()
-                else:
-                    cand = df_all[df_all["Entry"].astype(str).isin([
-                        "CANDIDATE_BUY", "WATCH_BREAKOUT", "WATCH_PULLBACK",
-                        "WATCH_52WK", "WATCH_MA_STACK"
-                    ])].copy()
-
-                # ✅ (방탄) 컬럼 깨짐 방어: Ticker 없으면 승격 스킵
-                if cand is None or (not isinstance(cand, pd.DataFrame)) or ("Ticker" not in cand.columns):
-                    cand = pd.DataFrame(columns=df_all.columns)
-
-                # ✅ 완화 RR 조건: RR이 있는 것만 필터링 (WATCH는 RR이 없을 수 있음)
-                # WATCH_*는 RR이 None일 수 있으니 RR 필터는 CANDIDATE_BUY에만 적용
-                if not cand.empty:
-                    is_candbuy = cand["Entry"].astype(str) == "CANDIDATE_BUY"
-                    candbuy = cand[is_candbuy].copy()
-                    watch   = cand[~is_candbuy].copy()
-
-                    candbuy = candbuy[candbuy["RR"].fillna(-1) >= relaxed_rr]
-                    cand = pd.concat([candbuy, watch], ignore_index=True)
-
-                # ✅ 돌파 계열은 볼륨 완화 조건 적용 (WATCH_BREAKOUT 포함)
-                def _vol_ok(row):
-                    e = str(row.get("Entry", ""))
-                    raw = str(row.get("EntryRaw", ""))
-
-                    # breakout 계열(원신호 or watch breakout)은 relaxed_vol 이상만
-                    if (raw == "BUY_BREAKOUT") or (e == "WATCH_BREAKOUT"):
-                        return float(row.get("VolRatio", 0) or 0) >= relaxed_vol
-
-                    # pullback 계열은 볼륨 강제 X
-                    return True
-
-                if not cand.empty:
-                    cand = cand[cand.apply(_vol_ok, axis=1)]
-
-                # 이미 뽑힌 BUY와 중복 제거 (buy_df도 방탄)
-                if (buy_df is None) or (not isinstance(buy_df, pd.DataFrame)) or buy_df.empty or ("Ticker" not in buy_df.columns):
-                    already = set()
-                else:
-                    already = set(buy_df["Ticker"].astype(str).tolist())
-
-                # ✅ cand에 Ticker가 있을 때만 중복 제거
-                if not cand.empty and ("Ticker" in cand.columns):
-                    cand = cand[~cand["Ticker"].astype(str).isin(already)]
-
-                # ✅ 점수/유동성 상위부터 승격 (need만큼)
-                if not cand.empty:
-                    cand = cand.sort_values(["Score", "Avg$Vol"], ascending=[False, False]).head(need).copy()
-                    rs_lookback = int(getattr(cfg, "RS_LOOKBACK_DAYS", 20))
-                    def _tag(row):
-                        row["Entry"] = "BUY_SMART"
-                        row["Promoted"] = True
-                        row["PromoTag"] = "🟣✅ PROMOTED"
-                        # ✅ Promoted 종목도 RS_vs_SPY 채우기 (data 우선, 없으면 yf 직접 조회)
-                        if (not row.get("RS_vs_SPY") or not str(row.get("RS_vs_SPY", "")).strip()):
-                            tkr = row.get("Ticker", None)
-                            if tkr:
-                                df_t, spy_close = None, None
-                                try:
-                                    if data is not None and isinstance(data.columns, pd.MultiIndex) and tkr in data.columns.get_level_values(0) and "SPY" in data.columns.get_level_values(0):
-                                        df_t = data[tkr].copy()
-                                        if isinstance(df_t.columns, pd.MultiIndex):
-                                            df_t.columns = df_t.columns.get_level_values(0)
-                                        spy_close = data["SPY"]["Close"].copy()
-                                except Exception:
-                                    pass
-                                if (df_t is None or df_t.empty or spy_close is None) or len(df_t) < rs_lookback + 1:
-                                    try:
-                                        dl = yf.download([tkr, "SPY"], period="1y", interval="1d", group_by="ticker", auto_adjust=False, progress=False, threads=False)
-                                        if dl is not None and not dl.empty:
-                                            if isinstance(dl.columns, pd.MultiIndex) and tkr in dl.columns.get_level_values(0) and "SPY" in dl.columns.get_level_values(0):
-                                                df_t = dl[tkr].copy()
-                                                if isinstance(df_t.columns, pd.MultiIndex):
-                                                    df_t.columns = df_t.columns.get_level_values(0)
-                                                spy_close = dl["SPY"]["Close"].copy()
-                                    except Exception:
-                                        pass
-                                if df_t is not None and not df_t.empty and spy_close is not None and len(df_t) >= rs_lookback + 1:
-                                    try:
-                                        stock_ret, spy_ret = compute_rs_vs_spy(df_t, spy_close, rs_lookback)
-                                        if stock_ret is not None and spy_ret is not None:
-                                            row["RS_vs_SPY"] = f"종목 {stock_ret*100:.1f}% vs SPY {spy_ret*100:.1f}%"
-                                    except Exception:
-                                        pass
-                        # 🔥 승격 시에도 트레이드 플랜 생성 (안정 버전)
-                        try:
-                            tkr = row.get("Ticker", None)
-                            if not tkr:
-                                return row
-
-                            if isinstance(data.columns, pd.MultiIndex) and tkr in data.columns.get_level_values(0):
-                                dfp = data[tkr].copy()
-                            else:
-                                return row
-
-                            if isinstance(dfp.columns, pd.MultiIndex):
-                                dfp.columns = dfp.columns.get_level_values(0)
-
-                            dfp = dfp.dropna(subset=["Open","High","Low","Close","Volume"]).copy()
-
-                            close = dfp["Close"]
-                            dfp["SMA20"] = sma(close, 20)
-                            dfp["SMA50"] = sma(close, 50)
-                            dfp["SMA200"] = sma(close, 200)
-                            dfp["ATR14"] = atr(dfp, 14)
-                            dfp["ADX14"] = adx(dfp, 14)
-
-                            dfp2 = dfp.dropna().copy()
-                            if len(dfp2) < 140:
-                                return row
-
-                            raw = row.get("EntryRaw", None)
-
-                            # ✅ WATCH에서 승격된 종목도 플랜 계산 가능하게 매핑
-                            if raw == "WATCH_BREAKOUT":
-                                raw = "BUY_BREAKOUT"
-                            elif raw == "WATCH_PULLBACK":
-                                raw = "BUY_PULLBACK"
-
-                            if raw not in ("BUY_BREAKOUT", "BUY_PULLBACK"):
-                                return row
-
-
-                            plan = calc_trade_plan(dfp2, raw)
-                            if not plan:
-                                return row
-                            
-                            # ✅ PROMOTED 방탄: Target이 Entry보다 의미있게 위 + RR 기준 충족해야만 승격
-                            relaxed_rr = float(getattr(cfg, "SMART_MIN_RR", max(1.2, cfg.MIN_RR - 0.3)))
-                            if (plan["TargetPrice"] <= plan["EntryPrice"] * 1.002) or (plan["RR"] < relaxed_rr):
-                                # 승격 실패 처리(이 row는 PROMOTED로 쓰지 않게 됨)
-                                row["Promoted"] = False
-                                row["PromoTag"] = ""
-                                return row
-
-                            row["EntryPrice"] = plan["EntryPrice"]
-                            row["StopPrice"] = plan["StopPrice"]
-                            row["TargetPrice"] = plan["TargetPrice"]
-                            row["RR"] = plan["RR"]
-                            row["Shares"] = plan["Shares"]
-                            row["PosValue"] = plan["PosValue"]
-
-                        except Exception:
-                            return row
-
-                        drop_reason = str(row.get("Note", "")).strip() or "(사유 없음)"
-                        promo_reason = "SMART 승격 (RR/볼륨 완화 조건 충족)"
-                        row["Note"] = f"[BUY 탈락 이유: {drop_reason}] [Promoted 선정 이유: {promo_reason}]"
-                        return row
-
-                    cand = cand.apply(_tag, axis=1)
-                    # ✅ 승격 성공한 것만 사용
-                    cand = cand[cand.get("Promoted", False) == True].copy()
-
-                    # buy_df에 합치기 (한쪽이 비어 있으면 그대로 대입하여 concat 경고 방지)
-                    if buy_df.empty:
-                        buy_df = cand.copy()
-                    else:
-                        buy_df = pd.concat([buy_df, cand], ignore_index=True)
-                    buy_df = buy_df.head(cfg.MAX_BUY_PER_DAY)
-                    # ✅ (방탄) BUY 리스트에 플랜 없는 행 제거 (NaN Shares 방지)
-                    if buy_df is not None and isinstance(buy_df, pd.DataFrame) and not buy_df.empty:
-                        for col in ["Shares", "PosValue", "EntryPrice", "StopPrice", "TargetPrice"]:
-                            if col not in buy_df.columns:
-                                buy_df[col] = np.nan
-
-                        buy_df = buy_df.dropna(subset=["Shares", "PosValue", "EntryPrice", "StopPrice", "TargetPrice"]).copy()
+    buy_df = apply_smart_relax_promote(df_all, buy_df, watch_df, data, run_date, rs_col="RS_vs_SPY")
 
     # BUY 리스트를 EV(기대값) 순으로 정렬 — 상단일수록 더 투자하기 좋은 순서
     if buy_df is not None and not buy_df.empty:
         buy_df = ev_rank_top_picks(buy_df, n=cfg.MAX_BUY_PER_DAY)
+        # ✅ BUY 행 EV/Prob를 ev_rank 결과로 df_out·df_all 동기화 (CSV·스냅샷 일치)
+        _sync_buy_ev_prob_to_dfs(buy_df, df_out, df_all)
 
     # -----------------------------
     # ✅ 보유 포지션 매도/익절 신호 (이미 받은 data 재사용)
